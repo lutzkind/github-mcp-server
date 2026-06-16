@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -693,6 +695,194 @@ func FetchRepoIsPrivate(ctx context.Context, client *github.Client, owner, repo 
 	return r.GetPrivate(), nil
 }
 
+func isSecretLikeRepoPath(path string) bool {
+	lower := strings.ToLower(strings.TrimSpace(path))
+	base := filepath.Base(lower)
+	switch {
+	case lower == ".env",
+		strings.HasPrefix(base, ".env."),
+		base == "id_rsa",
+		base == "id_ed25519",
+		strings.HasSuffix(base, ".pem"),
+		strings.HasSuffix(base, ".key"),
+		base == "credentials.json",
+		strings.Contains(base, "service-account") && strings.HasSuffix(base, ".json"),
+		strings.HasSuffix(base, ".sql"),
+		strings.HasSuffix(base, ".dump"),
+		strings.HasSuffix(base, ".bak"),
+		strings.HasSuffix(base, ".sqlite"),
+		strings.HasSuffix(base, ".sqlite3"):
+		return true
+	default:
+		return false
+	}
+}
+
+func detectFileMimeType(path, fallback string) string {
+	if strings.EqualFold(filepath.Base(path), "Dockerfile") {
+		return "text/x-dockerfile"
+	}
+	if ext := filepath.Ext(path); ext != "" {
+		if byExt := mime.TypeByExtension(ext); byExt != "" {
+			return byExt
+		}
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return "text/plain; charset=utf-8"
+}
+
+func detectFenceLanguage(path string) string {
+	if strings.EqualFold(filepath.Base(path), "Dockerfile") {
+		return "dockerfile"
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".py":
+		return "py"
+	case ".ts":
+		return "ts"
+	case ".tsx":
+		return "tsx"
+	case ".js":
+		return "js"
+	case ".jsx":
+		return "jsx"
+	case ".json":
+		return "json"
+	case ".md":
+		return "md"
+	case ".yml", ".yaml":
+		return "yaml"
+	case ".toml":
+		return "toml"
+	case ".css":
+		return "css"
+	case ".html":
+		return "html"
+	case ".sh":
+		return "sh"
+	default:
+		return "text"
+	}
+}
+
+func trimTextByBytes(content string, maxBytes int) (string, bool) {
+	if maxBytes <= 0 || len(content) <= maxBytes {
+		return content, false
+	}
+	return content[:maxBytes], true
+}
+
+func optionalIntArg(args map[string]any, key string) int {
+	value, ok := args[key]
+	if !ok || value == nil {
+		return 0
+	}
+	switch v := value.(type) {
+	case int:
+		return v
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
+func sliceTextByLines(content string, startLine, endLine int) (string, int, int, bool) {
+	lines := strings.Split(content, "\n")
+	if startLine < 1 {
+		startLine = 1
+	}
+	if endLine < startLine || endLine == 0 {
+		endLine = len(lines)
+	}
+	if startLine > len(lines) {
+		return "", startLine, startLine, true
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+	return strings.Join(lines[startLine-1:endLine], "\n"), startLine, endLine, endLine < len(lines)
+}
+
+func newInlineFileToolResult(owner, repo, filePath, ref, sha, mimeType, content string, startLine, endLine int, truncated bool) *mcp.CallToolResult {
+	structured := map[string]any{
+		"owner":      owner,
+		"repo":       repo,
+		"path":       filePath,
+		"ref":        ref,
+		"sha":        sha,
+		"mime_type":  mimeType,
+		"encoding":   "utf-8",
+		"truncated":  truncated,
+		"start_line": startLine,
+		"end_line":   endLine,
+		"content":    content,
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{
+				Text: fmt.Sprintf("File: %s\nRepo: %s/%s\nRef: %s\nSHA: %s\n\n```%s\n%s\n```",
+					filePath,
+					owner,
+					repo,
+					ref,
+					sha,
+					detectFenceLanguage(filePath),
+					content,
+				),
+			},
+		},
+		StructuredContent: structured,
+	}
+}
+
+func newBlockedFileToolResult(path, reason string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: fmt.Sprintf(`{"blocked":true,"reason":"%s","path":"%s"}`, reason, path)},
+		},
+		StructuredContent: map[string]any{
+			"blocked": true,
+			"reason":  reason,
+			"path":    path,
+		},
+		IsError: true,
+	}
+}
+
+func newBinaryMetadataToolResult(owner, repo, filePath, ref, sha, mimeType string, size int) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{
+				Text: fmt.Sprintf("Binary file not inlined.\nPath: %s\nRepo: %s/%s\nRef: %s\nSHA: %s\nMIME: %s\nSize: %d",
+					filePath, owner, repo, ref, sha, mimeType, size),
+			},
+		},
+		StructuredContent: map[string]any{
+			"owner":      owner,
+			"repo":       repo,
+			"path":       filePath,
+			"ref":        ref,
+			"sha":        sha,
+			"mime_type":  mimeType,
+			"encoding":   "binary",
+			"size":       size,
+			"truncated":  true,
+			"start_line": 0,
+			"end_line":   0,
+			"content":    "",
+			"blocked":    true,
+			"reason":     "binary_file",
+		},
+	}
+}
+
 // GetFileContents creates a tool to get the contents of a file or directory from a GitHub repository.
 func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool {
 	return NewTool(
@@ -728,6 +918,18 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 						Type:        "string",
 						Description: "Accepts optional commit SHA. If specified, it will be used instead of ref",
 					},
+					"start_line": {
+						Type:        "integer",
+						Description: "Optional start line for text file reads",
+					},
+					"end_line": {
+						Type:        "integer",
+						Description: "Optional end line for text file reads",
+					},
+					"max_bytes": {
+						Type:        "integer",
+						Description: "Optional maximum UTF-8 bytes to return for text file reads",
+					},
 				},
 				Required: []string{"owner", "repo"},
 			},
@@ -748,6 +950,9 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			path = strings.TrimPrefix(path, "/")
+			if isSecretLikeRepoPath(path) {
+				return newBlockedFileToolResult(path, "secret_like_file"), nil, nil
+			}
 
 			ref, err := OptionalParam[string](args, "ref")
 			if err != nil {
@@ -778,6 +983,9 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 			if err != nil {
 				return utils.NewToolResultError(fmt.Sprintf("failed to resolve git reference: %s", err)), nil, nil
 			}
+			startLine := optionalIntArg(args, "start_line")
+			endLine := optionalIntArg(args, "end_line")
+			maxBytes := optionalIntArg(args, "max_bytes")
 
 			if rawOpts.SHA != "" {
 				ref = rawOpts.SHA
@@ -802,85 +1010,87 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 			if fileContent != nil && fileContent.SHA != nil {
 				fileSHA = *fileContent.SHA
 				fileSize := fileContent.GetSize()
-				// Build resource URI for the file using URI templates
-				pathParts := strings.Split(path, "/")
-				resourceURI, err := expandRepoResourceURI(owner, repo, sha, ref, pathParts)
-				if err != nil {
-					return utils.NewToolResultError("failed to build resource URI"), nil, nil
-				}
 
 				// main branch ref passed in ref parameter but it doesn't exist - default branch was used
 				var successNote string
 				if fallbackUsed {
 					successNote = fmt.Sprintf(" Note: the provided ref '%s' does not exist, default branch '%s' was used instead.", originalRef, rawOpts.Ref)
 				}
-
-				// Empty files (0 bytes) have no content to decode; return
-				// them directly as empty text to avoid errors from
-				// GetContent when the API returns null content with a
-				// base64 encoding field, and to avoid DetectContentType
-				// misclassifying them as binary.
 				if fileSize == 0 {
-					result := &mcp.ResourceContents{
-						URI:      resourceURI,
-						Text:     "",
-						MIMEType: "text/plain",
+					result := newInlineFileToolResult(owner, repo, path, rawOpts.Ref, fileSHA, "text/plain", "", 1, 1, false)
+					if successNote != "" {
+						text := result.Content[0].(*mcp.TextContent)
+						text.Text = strings.Replace(text.Text, "\n\n```", fmt.Sprintf("%s\n\n```", successNote), 1)
 					}
-					return attachIFC(utils.NewToolResultResource(fmt.Sprintf("successfully downloaded empty file (SHA: %s)%s", fileSHA, successNote), result)), nil, nil
+					return attachIFC(result), nil, nil
 				}
 
-				// For files >= 1MB, return a ResourceLink instead of content
+				var contentBytes []byte
+				var contentType string
 				const maxContentSize = 1024 * 1024 // 1MB
-				if fileSize >= maxContentSize {
-					size := int64(fileSize)
-					resourceLink := &mcp.ResourceLink{
-						URI:   resourceURI,
-						Name:  fileContent.GetName(),
-						Title: fmt.Sprintf("File: %s", path),
-						Size:  &size,
+				useRaw := fileSize >= maxContentSize
+				if !useRaw {
+					content, decodeErr := fileContent.GetContent()
+					if decodeErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to decode file content: %s", decodeErr)), nil, nil
 					}
-					return attachIFC(utils.NewToolResultResourceLink(
-						fmt.Sprintf("File %s is too large to display (%d bytes). Use the download URL to fetch the content: %s (SHA: %s)%s",
-							path, fileSize, fileContent.GetDownloadURL(), fileSHA, successNote),
-						resourceLink)), nil, nil
+					contentBytes = []byte(content)
+					contentType = detectFileMimeType(path, http.DetectContentType(contentBytes))
+				} else {
+					rawClient, rawErr := deps.GetRawClient(ctx)
+					if rawErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to get GitHub raw content client: %s", rawErr)), nil, nil
+					}
+					rawResp, rawErr := rawClient.GetRawContent(ctx, owner, repo, path, rawOpts)
+					if rawErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to fetch raw file content: %s", rawErr)), nil, nil
+					}
+					defer func() { _ = rawResp.Body.Close() }()
+					if rawResp.StatusCode != http.StatusOK {
+						body, readErr := io.ReadAll(rawResp.Body)
+						if readErr == nil {
+							_ = body
+						}
+						return attachIFC(newBinaryMetadataToolResult(owner, repo, path, rawOpts.Ref, fileSHA, detectFileMimeType(path, "application/octet-stream"), fileSize)), nil, nil
+					}
+					contentBytes, err = io.ReadAll(rawResp.Body)
+					if err != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to read file content: %s", err)), nil, nil
+					}
+					contentType = detectFileMimeType(path, rawResp.Header.Get("Content-Type"))
 				}
-
-				// For files < 1MB, get content directly from Contents API
-				content, err := fileContent.GetContent()
-				if err != nil {
-					return utils.NewToolResultError(fmt.Sprintf("failed to decode file content: %s", err)), nil, nil
-				}
-
-				// Detect content type from the actual content bytes,
-				// mirroring the original approach of using the Content-Type header
-				// from the raw API response.
-				contentBytes := []byte(content)
-				contentType := http.DetectContentType(contentBytes)
-
-				// Determine if content is text or binary based on detected content type
 				isTextContent := strings.HasPrefix(contentType, "text/") ||
 					contentType == "application/json" ||
 					contentType == "application/xml" ||
 					strings.HasSuffix(contentType, "+json") ||
 					strings.HasSuffix(contentType, "+xml")
+				if !isTextContent {
+					msg := fmt.Sprintf("Binary file not inlined (SHA: %s)%s", fileSHA, successNote)
+					return attachIFC(newBinaryMetadataToolResult(owner, repo, path, rawOpts.Ref, fileSHA, contentType, fileSize)), map[string]any{"message": msg}, nil
+				}
 
-				if isTextContent {
-					result := &mcp.ResourceContents{
-						URI:      resourceURI,
-						Text:     content,
-						MIMEType: contentType,
+				content := string(contentBytes)
+				if startLine > 0 || endLine > 0 {
+					var truncated bool
+					content, startLine, endLine, truncated = sliceTextByLines(content, startLine, endLine)
+					result := newInlineFileToolResult(owner, repo, path, rawOpts.Ref, fileSHA, contentType, content, startLine, endLine, truncated)
+					if successNote != "" {
+						text := result.Content[0].(*mcp.TextContent)
+						text.Text = strings.Replace(text.Text, "\n\n```", fmt.Sprintf("%s\n\n```", successNote), 1)
 					}
-					return attachIFC(utils.NewToolResultResource(fmt.Sprintf("successfully downloaded text file (SHA: %s)%s", fileSHA, successNote), result)), nil, nil
+					return attachIFC(result), nil, nil
 				}
 
-				// Binary content - encode as base64 blob
-				blobContent := base64.StdEncoding.EncodeToString(contentBytes)
-				result := &mcp.ResourceContents{
-					URI:      resourceURI,
-					Blob:     []byte(blobContent),
-					MIMEType: contentType,
+				if maxBytes == 0 {
+					maxBytes = 128 * 1024
 				}
-				return attachIFC(utils.NewToolResultResource(fmt.Sprintf("successfully downloaded binary file (SHA: %s)%s", fileSHA, successNote), result)), nil, nil
+				content, truncated := trimTextByBytes(content, maxBytes)
+				result := newInlineFileToolResult(owner, repo, path, rawOpts.Ref, fileSHA, contentType, content, 1, strings.Count(content, "\n")+1, truncated)
+				if successNote != "" {
+					text := result.Content[0].(*mcp.TextContent)
+					text.Text = strings.Replace(text.Text, "\n\n```", fmt.Sprintf("%s\n\n```", successNote), 1)
+				}
+				return attachIFC(result), nil, nil
 			} else if dirContent != nil {
 				// file content or file SHA is nil which means it's a directory
 				r, err := json.Marshal(dirContent)

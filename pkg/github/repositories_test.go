@@ -39,6 +39,9 @@ func Test_GetFileContents(t *testing.T) {
 	assert.Contains(t, schema.Properties, "path")
 	assert.Contains(t, schema.Properties, "ref")
 	assert.Contains(t, schema.Properties, "sha")
+	assert.Contains(t, schema.Properties, "start_line")
+	assert.Contains(t, schema.Properties, "end_line")
+	assert.Contains(t, schema.Properties, "max_bytes")
 	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo"})
 
 	// Mock response for raw content
@@ -105,7 +108,7 @@ func Test_GetFileContents(t *testing.T) {
 			expectedResult: mcp.ResourceContents{
 				URI:      "repo://owner/repo/refs/heads/main/contents/README.md",
 				Text:     "# Test Repository\n\nThis is a test repository.",
-				MIMEType: "text/plain; charset=utf-8",
+				MIMEType: "text/markdown; charset=utf-8",
 			},
 		},
 		{
@@ -232,7 +235,7 @@ func Test_GetFileContents(t *testing.T) {
 			expectedResult: mcp.ResourceContents{
 				URI:      "repo://owner/repo/refs/heads/main/contents/README.md",
 				Text:     "# Test Repository\n\nThis is a test repository.",
-				MIMEType: "text/plain; charset=utf-8",
+				MIMEType: "text/markdown; charset=utf-8",
 			},
 		},
 		{
@@ -316,7 +319,7 @@ func Test_GetFileContents(t *testing.T) {
 			expectedResult: mcp.ResourceContents{
 				URI:      "repo://owner/repo/sha/abc123def456abc123def456abc123def456abc1/contents/README.md",
 				Text:     "# Test Repository\n\nThis is a test repository.",
-				MIMEType: "text/plain; charset=utf-8",
+				MIMEType: "text/markdown; charset=utf-8",
 			},
 			expectedMsg: " Note: the provided ref 'main' does not exist, default branch 'refs/heads/develop' was used instead.",
 		},
@@ -339,6 +342,11 @@ func Test_GetFileContents(t *testing.T) {
 					contentBytes, _ := json.Marshal(fileContent)
 					_, _ = w.Write(contentBytes)
 				},
+				GetRawReposContentsByOwnerByRepoByPath: func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/octet-stream")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte{0x01, 0x02, 0x03})
+				},
 			}),
 			requestArgs: map[string]any{
 				"owner": "owner",
@@ -347,10 +355,9 @@ func Test_GetFileContents(t *testing.T) {
 				"ref":   "refs/heads/main",
 			},
 			expectError: false,
-			expectedResult: &mcp.ResourceLink{
-				URI:   "repo://owner/repo/refs/heads/main/contents/large-file.bin",
-				Name:  "large-file.bin",
-				Title: "File: large-file.bin",
+			expectedResult: mcp.ResourceContents{
+				MIMEType: "application/octet-stream",
+				Blob:     []byte("non-empty"),
 			},
 		},
 		{
@@ -385,7 +392,6 @@ func Test_GetFileContents(t *testing.T) {
 				Text:     "",
 				MIMEType: "text/plain",
 			},
-			expectedMsg: "successfully downloaded empty file",
 		},
 		{
 			name: "content fetch fails",
@@ -441,16 +447,23 @@ func Test_GetFileContents(t *testing.T) {
 			// Use the correct result helper based on the expected type
 			switch expected := tc.expectedResult.(type) {
 			case mcp.ResourceContents:
-				// Handle both text and blob resources
-				resource := getResourceResult(t, result)
-				assert.Equal(t, expected, *resource)
-
-				// If expectedMsg is set, verify the message text
-				if tc.expectedMsg != "" {
-					require.Len(t, result.Content, 2)
-					textContent, ok := result.Content[0].(*mcp.TextContent)
-					require.True(t, ok, "expected Content[0] to be TextContent")
-					assert.Contains(t, textContent.Text, tc.expectedMsg)
+				if expected.Blob == nil {
+					textContent := getTextResult(t, result)
+					assert.Contains(t, textContent.Text, expected.Text)
+					sc, ok := result.StructuredContent.(map[string]any)
+					require.True(t, ok, "expected structured content for text file")
+					assert.Equal(t, expected.Text, sc["content"])
+					assert.Equal(t, expected.MIMEType, sc["mime_type"])
+					if tc.expectedMsg != "" {
+						assert.Contains(t, textContent.Text, tc.expectedMsg)
+					}
+				} else {
+					textContent := getTextResult(t, result)
+					assert.Contains(t, textContent.Text, "Binary file not inlined")
+					sc, ok := result.StructuredContent.(map[string]any)
+					require.True(t, ok, "expected structured content for binary file")
+					assert.Equal(t, expected.MIMEType, sc["mime_type"])
+					assert.Equal(t, true, sc["blocked"])
 				}
 			case []*github.RepositoryContent:
 				// Directory content fetch returns a text result (JSON array)
@@ -464,14 +477,6 @@ func Test_GetFileContents(t *testing.T) {
 					assert.Equal(t, *expected[i].Path, *content.Path)
 					assert.Equal(t, *expected[i].Type, *content.Type)
 				}
-			case *mcp.ResourceLink:
-				// Large file returns a ResourceLink
-				require.Len(t, result.Content, 2)
-				resourceLink, ok := result.Content[1].(*mcp.ResourceLink)
-				require.True(t, ok, "expected Content[1] to be ResourceLink")
-				assert.Equal(t, expected.URI, resourceLink.URI)
-				assert.Equal(t, expected.Name, resourceLink.Name)
-				assert.Equal(t, expected.Title, resourceLink.Title)
 			case mcp.TextContent:
 				textContent := getErrorResult(t, result)
 				require.Equal(t, textContent, expected)
@@ -620,6 +625,71 @@ func Test_GetFileContents_IFC_InsidersMode(t *testing.T) {
 			assert.False(t, hasIFC, "ifc label should be omitted when visibility lookup fails")
 		}
 	})
+}
+
+func Test_GetFileContents_BlocksSecretLikePaths(t *testing.T) {
+	serverTool := GetFileContents(translations.NullTranslationHelper)
+	client := mustNewGHClient(t, NewMockedHTTPClient())
+	deps := BaseDeps{Client: client}
+	handler := serverTool.Handler(deps)
+	request := createMCPRequest(map[string]any{
+		"owner": "owner",
+		"repo":  "repo",
+		"path":  ".env.production",
+	})
+
+	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	textContent := getErrorResult(t, result)
+	assert.Contains(t, textContent.Text, `"blocked":true`)
+	assert.Contains(t, textContent.Text, `"reason":"secret_like_file"`)
+}
+
+func Test_GetFileContents_LineRange(t *testing.T) {
+	serverTool := GetFileContents(translations.NullTranslationHelper)
+	content := []byte("one\ntwo\nthree\nfour\n")
+	client := mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+		GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, "{\"ref\": \"refs/heads/main\", \"object\": {\"sha\": \"\"}}"),
+		GetReposByOwnerByRepo:            mockResponse(t, http.StatusOK, "{\"name\": \"repo\", \"default_branch\": \"main\"}"),
+		GetReposContentsByOwnerByRepoByPath: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			encodedContent := base64.StdEncoding.EncodeToString(content)
+			fileContent := &github.RepositoryContent{
+				Name:     github.Ptr("README.md"),
+				Path:     github.Ptr("README.md"),
+				SHA:      github.Ptr("abc123"),
+				Type:     github.Ptr("file"),
+				Content:  github.Ptr(encodedContent),
+				Size:     github.Ptr(len(content)),
+				Encoding: github.Ptr("base64"),
+			}
+			contentBytes, _ := json.Marshal(fileContent)
+			_, _ = w.Write(contentBytes)
+		},
+	}))
+	mockRawClient, err := raw.NewClient(client, &url.URL{Scheme: "https", Host: "raw.example.com", Path: "/"})
+	require.NoError(t, err)
+	deps := BaseDeps{Client: client, RawClient: mockRawClient}
+	handler := serverTool.Handler(deps)
+	request := createMCPRequest(map[string]any{
+		"owner":      "owner",
+		"repo":       "repo",
+		"path":       "README.md",
+		"ref":        "refs/heads/main",
+		"start_line": 2,
+		"end_line":   3,
+	})
+
+	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	textContent := getTextResult(t, result)
+	assert.Contains(t, textContent.Text, "two\nthree")
+	sc, ok := result.StructuredContent.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 2, sc["start_line"])
+	assert.Equal(t, 3, sc["end_line"])
+	assert.Equal(t, "two\nthree", sc["content"])
 }
 
 // Test_GetCommit_IFC_FeatureFlag verifies that the IFC security label is only

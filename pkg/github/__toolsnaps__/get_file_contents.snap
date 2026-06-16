@@ -6,6 +6,14 @@
   "description": "Get the contents of a file or directory from a GitHub repository",
   "inputSchema": {
     "properties": {
+      "end_line": {
+        "description": "Optional end line for text file reads",
+        "type": "integer"
+      },
+      "max_bytes": {
+        "description": "Optional maximum UTF-8 bytes to return for text file reads",
+        "type": "integer"
+      },
       "owner": {
         "description": "Repository owner (username or organization)",
         "type": "string"
@@ -26,6 +34,10 @@
       "sha": {
         "description": "Accepts optional commit SHA. If specified, it will be used instead of ref",
         "type": "string"
+      },
+      "start_line": {
+        "description": "Optional start line for text file reads",
+        "type": "integer"
       }
     },
     "required": [
