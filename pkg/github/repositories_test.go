@@ -2101,6 +2101,20 @@ func Test_CreateOrUpdateFileFromSharedPath(t *testing.T) {
 			},
 		},
 		{
+			name:         "reject absolute path",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: map[string]any{
+				"owner":       "owner",
+				"repo":        "repo",
+				"path":        "src/worker.js",
+				"shared_path": "/etc/passwd",
+				"message":     "Patch worker",
+				"branch":      "feature/test",
+			},
+			expectError:    true,
+			expectedErrMsg: "shared_path must be relative to the shared directory",
+		},
+		{
 			name:         "reject path traversal",
 			mockedClient: NewMockedHTTPClient(),
 			requestArgs: map[string]any{
@@ -2126,7 +2140,27 @@ func Test_CreateOrUpdateFileFromSharedPath(t *testing.T) {
 				"branch":      "feature/test",
 			},
 			expectError:    true,
-			expectedErrMsg: "failed to stat shared file",
+			expectedErrMsg: "failed to resolve shared_path",
+		},
+		{
+			name:         "reject symlink escape",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: func() map[string]any {
+				outsideDir := t.TempDir()
+				outsideFile := filepath.Join(outsideDir, "secret.txt")
+				require.NoError(t, os.WriteFile(outsideFile, []byte("secret"), 0o644))
+				require.NoError(t, os.Symlink(outsideFile, filepath.Join(tempRoot, "escape.txt")))
+				return map[string]any{
+					"owner":       "owner",
+					"repo":        "repo",
+					"path":        "src/worker.js",
+					"shared_path": "escape.txt",
+					"message":     "Patch worker",
+					"branch":      "feature/test",
+				}
+			}(),
+			expectError:    true,
+			expectedErrMsg: "shared_path must stay within the shared directory",
 		},
 	}
 
@@ -2154,6 +2188,142 @@ func Test_CreateOrUpdateFileFromSharedPath(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, "src/worker.js", returnedContent.Content.Path)
 			assert.Equal(t, "commit-sha", returnedContent.Commit.SHA)
+			if tc.validate != nil {
+				tc.validate(t, result)
+			}
+		})
+	}
+}
+
+func Test_PushFilesFromSharedPaths(t *testing.T) {
+	serverTool := PushFilesFromSharedPaths(translations.NullTranslationHelper)
+	tool := serverTool.Tool
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
+
+	schema, ok := tool.InputSchema.(*jsonschema.Schema)
+	require.True(t, ok, "InputSchema should be *jsonschema.Schema")
+	assert.Equal(t, "push_files_from_shared_paths", tool.Name)
+	assert.Contains(t, schema.Properties, "files")
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "branch", "files", "message"})
+
+	tempRoot := t.TempDir()
+	t.Setenv("GITHUB_MCP_SHARED_ROOT", tempRoot)
+	require.NoError(t, os.MkdirAll(filepath.Join(tempRoot, "batch"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(tempRoot, "batch", "one.js"), []byte("export const one = 1;\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(tempRoot, "batch", "two.js"), []byte(strings.Repeat("x", 32*1024)), 0o644))
+
+	tests := []struct {
+		name           string
+		mockedClient   *http.Client
+		requestArgs    map[string]any
+		expectError    bool
+		expectedErrMsg string
+		validate       func(t *testing.T, result *mcp.CallToolResult)
+	}{
+		{
+			name: "successful multi-file push",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				"GET /repos/owner/repo/git/ref/heads/feature/test": mockResponse(t, http.StatusOK, &github.Reference{
+					Ref: github.Ptr("refs/heads/feature/test"),
+					Object: &github.GitObject{
+						SHA: github.Ptr("base-commit-sha"),
+					},
+				}),
+				"GET /repos/{owner}/{repo}/git/ref/{ref:.*}": mockResponse(t, http.StatusOK, &github.Reference{
+					Ref: github.Ptr("refs/heads/feature/test"),
+					Object: &github.GitObject{
+						SHA: github.Ptr("base-commit-sha"),
+					},
+				}),
+				"GET /repos/owner/repo/git/commits/base-commit-sha": mockResponse(t, http.StatusOK, &github.Commit{
+					SHA:  github.Ptr("base-commit-sha"),
+					Tree: &github.Tree{SHA: github.Ptr("base-tree-sha")},
+				}),
+				"GET /repos/{owner}/{repo}/git/commits/{commit_sha}": mockResponse(t, http.StatusOK, &github.Commit{
+					SHA:  github.Ptr("base-commit-sha"),
+					Tree: &github.Tree{SHA: github.Ptr("base-tree-sha")},
+				}),
+				"POST /repos/owner/repo/git/trees": mockResponse(t, http.StatusCreated, &github.Tree{
+					SHA: github.Ptr("new-tree-sha"),
+				}),
+				"POST /repos/{owner}/{repo}/git/trees": mockResponse(t, http.StatusCreated, &github.Tree{
+					SHA: github.Ptr("new-tree-sha"),
+				}),
+				"POST /repos/owner/repo/git/commits": mockResponse(t, http.StatusCreated, &github.Commit{
+					SHA: github.Ptr("new-commit-sha"),
+				}),
+				"POST /repos/{owner}/{repo}/git/commits": mockResponse(t, http.StatusCreated, &github.Commit{
+					SHA: github.Ptr("new-commit-sha"),
+				}),
+				"PATCH /repos/owner/repo/git/refs/heads/feature/test": mockResponse(t, http.StatusOK, &github.Reference{
+					Ref: github.Ptr("refs/heads/feature/test"),
+					Object: &github.GitObject{
+						SHA: github.Ptr("new-commit-sha"),
+					},
+				}),
+				"PATCH /repos/{owner}/{repo}/git/refs/{ref:.*}": mockResponse(t, http.StatusOK, &github.Reference{
+					Ref: github.Ptr("refs/heads/feature/test"),
+					Object: &github.GitObject{
+						SHA: github.Ptr("new-commit-sha"),
+					},
+				}),
+			}),
+			requestArgs: map[string]any{
+				"owner":   "owner",
+				"repo":    "repo",
+				"branch":  "feature/test",
+				"message": "Batch patch",
+				"files": []any{
+					map[string]any{"path": "src/one.js", "shared_path": "batch/one.js"},
+					map[string]any{"path": "src/two.js", "shared_path": "batch/two.js"},
+				},
+			},
+			validate: func(t *testing.T, result *mcp.CallToolResult) {
+				textContent := getTextResult(t, result)
+				var resp SharedPushFilesResponse
+				err := json.Unmarshal([]byte(textContent.Text), &resp)
+				require.NoError(t, err)
+				assert.Equal(t, "new-commit-sha", resp.CommitSHA)
+				assert.Equal(t, "feature/test", resp.Branch)
+				assert.Equal(t, []string{"src/one.js", "src/two.js"}, resp.ChangedPaths)
+				assert.Equal(t, 2, resp.FileCount)
+			},
+		},
+		{
+			name:         "reject traversal in multi-file push",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: map[string]any{
+				"owner":   "owner",
+				"repo":    "repo",
+				"branch":  "feature/test",
+				"message": "Batch patch",
+				"files": []any{
+					map[string]any{"path": "src/one.js", "shared_path": "../secret.txt"},
+				},
+			},
+			expectError:    true,
+			expectedErrMsg: "shared_path must stay within the shared directory",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := mustNewGHClient(t, tc.mockedClient)
+			deps := BaseDeps{Client: client}
+			handler := serverTool.Handler(deps)
+			request := createMCPRequest(tc.requestArgs)
+
+			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+			require.NoError(t, err)
+
+			if tc.expectError {
+				require.True(t, result.IsError)
+				errorContent := getErrorResult(t, result)
+				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
+				return
+			}
+
+			require.False(t, result.IsError)
 			if tc.validate != nil {
 				tc.validate(t, result)
 			}

@@ -479,26 +479,40 @@ func githubSharedRoot() string {
 	return "/shared"
 }
 
+const githubSharedMaxBytes = 2 * 1024 * 1024
+
 func resolveSharedPath(sharedPath string) (string, error) {
 	if strings.TrimSpace(sharedPath) == "" {
 		return "", fmt.Errorf("shared_path is required")
 	}
-	cleaned := filepath.Clean(strings.TrimPrefix(sharedPath, "/"))
+	if filepath.IsAbs(sharedPath) {
+		return "", fmt.Errorf("shared_path must be relative to the shared directory")
+	}
+	root := filepath.Clean(githubSharedRoot())
+	rootEval, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve shared root: %w", err)
+	}
+	cleaned := filepath.Clean(sharedPath)
 	if cleaned == "." || cleaned == "" {
 		return "", fmt.Errorf("shared_path must point to a file inside the shared directory")
 	}
 	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("shared_path must stay within the shared directory")
 	}
-	joined := filepath.Join(githubSharedRoot(), cleaned)
-	rel, err := filepath.Rel(githubSharedRoot(), joined)
+	joined := filepath.Join(rootEval, cleaned)
+	resolved, err := filepath.EvalSymlinks(joined)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve shared_path: %w", err)
+	}
+	rel, err := filepath.Rel(rootEval, resolved)
+	if err != nil {
+		return "", fmt.Errorf("failed to verify shared_path: %w", err)
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("shared_path must stay within the shared directory")
 	}
-	return joined, nil
+	return resolved, nil
 }
 
 func loadSharedTextFile(sharedPath string, maxBytes int) (string, int, error) {
@@ -524,6 +538,165 @@ func loadSharedTextFile(sharedPath string, maxBytes int) (string, int, error) {
 		return "", 0, fmt.Errorf("shared file is not valid UTF-8 text")
 	}
 	return string(contentBytes), len(contentBytes), nil
+}
+
+type sharedFileSpec struct {
+	RepoPath   string
+	SharedPath string
+	Content    string
+	SizeBytes  int
+}
+
+type SharedPushFilesResponse struct {
+	CommitSHA    string   `json:"commit_sha"`
+	Branch       string   `json:"branch"`
+	ChangedPaths []string `json:"changed_paths"`
+	FileCount    int      `json:"file_count"`
+}
+
+func parseSharedFileSpecs(args map[string]any) ([]sharedFileSpec, error) {
+	filesObj, ok := args["files"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("files parameter must be an array of objects with path and shared_path")
+	}
+	files := make([]sharedFileSpec, 0, len(filesObj))
+	for _, file := range filesObj {
+		fileMap, ok := file.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("each file must be an object with path and shared_path")
+		}
+		repoPath, ok := fileMap["path"].(string)
+		if !ok || strings.TrimSpace(repoPath) == "" {
+			return nil, fmt.Errorf("each file must have a path")
+		}
+		sharedPath, ok := fileMap["shared_path"].(string)
+		if !ok || strings.TrimSpace(sharedPath) == "" {
+			return nil, fmt.Errorf("each file must have a shared_path")
+		}
+		content, sizeBytes, err := loadSharedTextFile(sharedPath, githubSharedMaxBytes)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, sharedFileSpec{
+			RepoPath:   repoPath,
+			SharedPath: sharedPath,
+			Content:    content,
+			SizeBytes:  sizeBytes,
+		})
+	}
+	return files, nil
+}
+
+func prepareBranchBaseCommit(ctx context.Context, client *github.Client, owner, repo, branch string) (*github.Reference, *github.Commit, error) {
+	var repositoryIsEmpty bool
+	var branchNotFound bool
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	if err != nil {
+		ghErr, isGhErr := err.(*github.ErrorResponse)
+		if isGhErr {
+			if ghErr.Response.StatusCode == http.StatusConflict && ghErr.Message == "Git Repository is empty." {
+				repositoryIsEmpty = true
+			} else if ghErr.Response.StatusCode == http.StatusNotFound {
+				branchNotFound = true
+			}
+		}
+		if !repositoryIsEmpty && !branchNotFound {
+			return nil, nil, fmt.Errorf("failed to get branch reference: %w", err)
+		}
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	var baseCommit *github.Commit
+	if !repositoryIsEmpty {
+		if branchNotFound {
+			ref, err = createReferenceFromDefaultBranch(ctx, client, owner, repo, branch)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to create branch from default: %w", err)
+			}
+		}
+		baseCommit, resp, err = client.Git.GetCommit(ctx, owner, repo, *ref.Object.SHA)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get base commit: %w", err)
+		}
+		if resp != nil && resp.Body != nil {
+			defer func() { _ = resp.Body.Close() }()
+		}
+	} else {
+		var base *github.Commit
+		ref, base, err = initializeRepository(ctx, client, owner, repo)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to initialize repository: %w", err)
+		}
+		defaultBranch := strings.TrimPrefix(*ref.Ref, "refs/heads/")
+		if branch != defaultBranch {
+			ref, err = createReferenceFromDefaultBranch(ctx, client, owner, repo, branch)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to create branch from default: %w", err)
+			}
+		}
+		baseCommit = base
+	}
+	return ref, baseCommit, nil
+}
+
+func pushTreeEntries(ctx context.Context, client *github.Client, owner, repo, branch, message string, entries []*github.TreeEntry, changedPaths []string) (*mcp.CallToolResult, any, error) {
+	ref, baseCommit, err := prepareBranchBaseCommit(ctx, client, owner, repo, branch)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	newTree, resp, err := client.Git.CreateTree(ctx, owner, repo, *baseCommit.Tree.SHA, entries)
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx,
+			"failed to create tree",
+			resp,
+			err,
+		), nil, nil
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	commit := github.Commit{
+		Message: github.Ptr(message),
+		Tree:    newTree,
+		Parents: []*github.Commit{{SHA: baseCommit.SHA}},
+	}
+	newCommit, resp, err := client.Git.CreateCommit(ctx, owner, repo, commit, nil)
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx,
+			"failed to create commit",
+			resp,
+			err,
+		), nil, nil
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	_, resp, err = client.Git.UpdateRef(ctx, owner, repo, *ref.Ref, github.UpdateRef{
+		SHA:   *newCommit.SHA,
+		Force: github.Ptr(false),
+	})
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx,
+			"failed to update reference",
+			resp,
+			err,
+		), nil, nil
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	return MarshalledTextResult(SharedPushFilesResponse{
+		CommitSHA:    newCommit.GetSHA(),
+		Branch:       branch,
+		ChangedPaths: changedPaths,
+		FileCount:    len(changedPaths),
+	}), nil, nil
 }
 
 func firstTextResult(result *mcp.CallToolResult) *mcp.TextContent {
@@ -710,7 +883,7 @@ Only files inside the configured shared directory are allowed. SHA MUST be provi
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 
-			content, sizeBytes, err := loadSharedTextFile(sharedPath, 512*1024)
+			content, sizeBytes, err := loadSharedTextFile(sharedPath, githubSharedMaxBytes)
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -741,6 +914,102 @@ Only files inside the configured shared directory are allowed. SHA MUST be provi
 			}
 
 			return result, nil, nil
+		},
+	)
+}
+
+func PushFilesFromSharedPaths(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name:        "push_files_from_shared_paths",
+			Description: t("TOOL_PUSH_FILES_FROM_SHARED_PATHS_DESCRIPTION", "Push multiple UTF-8 text files from the shared directory to a GitHub repository in a single commit."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:        t("TOOL_PUSH_FILES_FROM_SHARED_PATHS_USER_TITLE", "Push files from shared paths"),
+				ReadOnlyHint: false,
+			},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"branch": {
+						Type:        "string",
+						Description: "Branch to push to",
+					},
+					"message": {
+						Type:        "string",
+						Description: "Commit message",
+					},
+					"files": {
+						Type:        "array",
+						Description: "Array of file objects to push, each object with path (repository path) and shared_path (relative path under the shared directory)",
+						Items: &jsonschema.Schema{
+							Type:                 "object",
+							AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+							Properties: map[string]*jsonschema.Schema{
+								"path": {
+									Type:        "string",
+									Description: "Repository path for the file",
+								},
+								"shared_path": {
+									Type:        "string",
+									Description: "Relative path under the shared directory mounted into the MCP container",
+								},
+							},
+							Required: []string{"path", "shared_path"},
+						},
+					},
+				},
+				Required: []string{"owner", "repo", "branch", "files", "message"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			branch, err := RequiredParam[string](args, "branch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			message, err := RequiredParam[string](args, "message")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			files, err := parseSharedFileSpecs(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+
+			entries := make([]*github.TreeEntry, 0, len(files))
+			changedPaths := make([]string, 0, len(files))
+			for _, file := range files {
+				entries = append(entries, &github.TreeEntry{
+					Path:    github.Ptr(file.RepoPath),
+					Mode:    github.Ptr("100644"),
+					Type:    github.Ptr("blob"),
+					Content: github.Ptr(file.Content),
+				})
+				changedPaths = append(changedPaths, file.RepoPath)
+			}
+
+			return pushTreeEntries(ctx, client, owner, repo, branch, message, entries, changedPaths)
 		},
 	)
 }
