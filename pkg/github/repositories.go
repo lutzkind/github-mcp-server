@@ -8,10 +8,12 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	ghErrors "github.com/github/github-mcp-server/pkg/errors"
 	"github.com/github/github-mcp-server/pkg/ifc"
@@ -457,119 +459,288 @@ SHA MUST be provided for existing file updates.
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-
-			// json.Marshal encodes byte arrays with base64, which is required for the API.
-			contentBytes := []byte(content)
-
-			// Create the file options
-			opts := &github.RepositoryContentFileOptions{
-				Message: github.Ptr(message),
-				Content: contentBytes,
-				Branch:  github.Ptr(branch),
-			}
-
-			// If SHA is provided, set it (for updates)
 			sha, err := OptionalParam[string](args, "sha")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			if sha != "" {
-				opts.SHA = github.Ptr(sha)
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+			return createOrUpdateFileResult(ctx, deps, client, owner, repo, path, content, message, branch, sha)
+		},
+	)
+}
+
+func githubSharedRoot() string {
+	if root := strings.TrimSpace(os.Getenv("GITHUB_MCP_SHARED_ROOT")); root != "" {
+		return root
+	}
+	return "/shared"
+}
+
+func resolveSharedPath(sharedPath string) (string, error) {
+	if strings.TrimSpace(sharedPath) == "" {
+		return "", fmt.Errorf("shared_path is required")
+	}
+	cleaned := filepath.Clean(strings.TrimPrefix(sharedPath, "/"))
+	if cleaned == "." || cleaned == "" {
+		return "", fmt.Errorf("shared_path must point to a file inside the shared directory")
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("shared_path must stay within the shared directory")
+	}
+	joined := filepath.Join(githubSharedRoot(), cleaned)
+	rel, err := filepath.Rel(githubSharedRoot(), joined)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve shared_path: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("shared_path must stay within the shared directory")
+	}
+	return joined, nil
+}
+
+func loadSharedTextFile(sharedPath string, maxBytes int) (string, int, error) {
+	resolved, err := resolveSharedPath(sharedPath)
+	if err != nil {
+		return "", 0, err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to stat shared file: %w", err)
+	}
+	if info.IsDir() {
+		return "", 0, fmt.Errorf("shared_path points to a directory, not a file")
+	}
+	if maxBytes > 0 && info.Size() > int64(maxBytes) {
+		return "", 0, fmt.Errorf("shared file is too large: %d bytes exceeds limit of %d bytes", info.Size(), maxBytes)
+	}
+	contentBytes, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to read shared file: %w", err)
+	}
+	if !utf8.Valid(contentBytes) {
+		return "", 0, fmt.Errorf("shared file is not valid UTF-8 text")
+	}
+	return string(contentBytes), len(contentBytes), nil
+}
+
+func firstTextResult(result *mcp.CallToolResult) *mcp.TextContent {
+	if result == nil {
+		return nil
+	}
+	for _, content := range result.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			return text
+		}
+	}
+	return nil
+}
+
+func createOrUpdateFileResult(ctx context.Context, deps ToolDependencies, client *github.Client, owner, repo, path, content, message, branch, sha string) (*mcp.CallToolResult, any, error) {
+	// json.Marshal encodes byte arrays with base64, which is required for the API.
+	contentBytes := []byte(content)
+
+	// Create the file options
+	opts := &github.RepositoryContentFileOptions{
+		Message: github.Ptr(message),
+		Content: contentBytes,
+		Branch:  github.Ptr(branch),
+	}
+	if sha != "" {
+		opts.SHA = github.Ptr(sha)
+	}
+
+	path = strings.TrimPrefix(path, "/")
+	getOpts := &github.RepositoryContentGetOptions{Ref: branch}
+
+	if sha != "" {
+		existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
+		if respCheck != nil {
+			_ = respCheck.Body.Close()
+		}
+		switch {
+		case getErr != nil:
+			if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx,
+					"failed to verify file SHA",
+					respCheck,
+					getErr,
+				), nil, nil
+			}
+		case dirContent != nil:
+			return utils.NewToolResultError(fmt.Sprintf(
+				"Path %s is a directory, not a file. This tool only works with files.",
+				path)), nil, nil
+		case existingFile != nil:
+			currentSHA := existingFile.GetSHA()
+			if currentSHA != sha {
+				return utils.NewToolResultError(fmt.Sprintf(
+					"SHA mismatch: provided SHA %s is stale. Current file SHA is %s. "+
+						"Pull the latest changes and use git rev-parse %s:%s to get the current SHA.",
+					sha, currentSHA, branch, path)), nil, nil
+			}
+		}
+	} else {
+		existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
+		if respCheck != nil {
+			_ = respCheck.Body.Close()
+		}
+		switch {
+		case getErr != nil:
+			if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx,
+					"failed to check if file exists",
+					respCheck,
+					getErr,
+				), nil, nil
+			}
+		case dirContent != nil:
+			return utils.NewToolResultError(fmt.Sprintf(
+				"Path %s is a directory, not a file. This tool only works with files.",
+				path)), nil, nil
+		case existingFile != nil:
+			return utils.NewToolResultError(fmt.Sprintf(
+				"File already exists at %s. You must provide the current file's SHA when updating. "+
+					"Use git rev-parse %s:%s to get the blob SHA, then retry with the sha parameter.",
+				path, branch, path)), nil, nil
+		}
+	}
+
+	fileContent, resp, err := client.Repositories.CreateFile(ctx, owner, repo, path, opts)
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx,
+			"failed to create/update file",
+			resp,
+			err,
+		), nil, nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read response body: %w", err)
+		}
+		return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to create/update file", resp, body), nil, nil
+	}
+
+	minimalResponse := convertToMinimalFileContentResponse(fileContent)
+	return MarshalledTextResult(minimalResponse), nil, nil
+}
+
+func CreateOrUpdateFileFromSharedPath(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name: "create_or_update_file_from_shared_path",
+			Description: t("TOOL_CREATE_OR_UPDATE_FILE_FROM_SHARED_PATH_DESCRIPTION", `Create or update a single file in a GitHub repository using a UTF-8 text file that already exists on the MCP host under the shared directory.
+
+Use this when the file content is already available on the server and is too large or too awkward to send inline through the MCP tool call.
+
+Only files inside the configured shared directory are allowed. SHA MUST be provided for existing file updates.`),
+			Annotations: &mcp.ToolAnnotations{
+				Title:        t("TOOL_CREATE_OR_UPDATE_FILE_FROM_SHARED_PATH_USER_TITLE", "Create or update file from shared path"),
+				ReadOnlyHint: false,
+			},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (username or organization)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"path": {
+						Type:        "string",
+						Description: "Repository path where to create/update the file",
+					},
+					"shared_path": {
+						Type:        "string",
+						Description: "Relative path under the shared directory mounted into the MCP container",
+					},
+					"message": {
+						Type:        "string",
+						Description: "Commit message",
+					},
+					"branch": {
+						Type:        "string",
+						Description: "Branch to create/update the file in",
+					},
+					"sha": {
+						Type:        "string",
+						Description: "The blob SHA of the file being replaced. Required if the file already exists.",
+					},
+				},
+				Required: []string{"owner", "repo", "path", "shared_path", "message", "branch"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			path, err := RequiredParam[string](args, "path")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			sharedPath, err := RequiredParam[string](args, "shared_path")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			message, err := RequiredParam[string](args, "message")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			branch, err := RequiredParam[string](args, "branch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			sha, err := OptionalParam[string](args, "sha")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 
-			// Create or update the file
+			content, sizeBytes, err := loadSharedTextFile(sharedPath, 512*1024)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
 			client, err := deps.GetClient(ctx)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
 
-			path = strings.TrimPrefix(path, "/")
-
-			// SHA validation using Contents API to fetch current file metadata (blob SHA)
-			getOpts := &github.RepositoryContentGetOptions{Ref: branch}
-
-			if sha != "" {
-				// User provided SHA - validate it's still current
-				existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
-				if respCheck != nil {
-					_ = respCheck.Body.Close()
-				}
-				switch {
-				case getErr != nil:
-					// 404 means file doesn't exist - proceed (new file creation)
-					// Any other error (403, 500, network) should be surfaced
-					if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
-						return ghErrors.NewGitHubAPIErrorResponse(ctx,
-							"failed to verify file SHA",
-							respCheck,
-							getErr,
-						), nil, nil
-					}
-				case dirContent != nil:
-					return utils.NewToolResultError(fmt.Sprintf(
-						"Path %s is a directory, not a file. This tool only works with files.",
-						path)), nil, nil
-				case existingFile != nil:
-					currentSHA := existingFile.GetSHA()
-					if currentSHA != sha {
-						return utils.NewToolResultError(fmt.Sprintf(
-							"SHA mismatch: provided SHA %s is stale. Current file SHA is %s. "+
-								"Pull the latest changes and use git rev-parse %s:%s to get the current SHA.",
-							sha, currentSHA, branch, path)), nil, nil
-					}
-				}
-			} else {
-				// No SHA provided - check if file already exists
-				existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
-				if respCheck != nil {
-					_ = respCheck.Body.Close()
-				}
-				switch {
-				case getErr != nil:
-					// 404 means file doesn't exist - proceed with creation
-					// Any other error (403, 500, network) should be surfaced
-					if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
-						return ghErrors.NewGitHubAPIErrorResponse(ctx,
-							"failed to check if file exists",
-							respCheck,
-							getErr,
-						), nil, nil
-					}
-				case dirContent != nil:
-					return utils.NewToolResultError(fmt.Sprintf(
-						"Path %s is a directory, not a file. This tool only works with files.",
-						path)), nil, nil
-				case existingFile != nil:
-					// File exists but no SHA was provided - reject to prevent blind overwrites
-					return utils.NewToolResultError(fmt.Sprintf(
-						"File already exists at %s. You must provide the current file's SHA when updating. "+
-							"Use git rev-parse %s:%s to get the blob SHA, then retry with the sha parameter.",
-						path, branch, path)), nil, nil
-				}
-				// If file not found, no previous SHA needed (new file creation)
+			result, _, err := createOrUpdateFileResult(ctx, deps, client, owner, repo, path, content, message, branch, sha)
+			if err != nil || result == nil || result.IsError {
+				return result, nil, err
 			}
 
-			fileContent, resp, err := client.Repositories.CreateFile(ctx, owner, repo, path, opts)
-			if err != nil {
-				return ghErrors.NewGitHubAPIErrorResponse(ctx,
-					"failed to create/update file",
-					resp,
-					err,
-				), nil, nil
+			textResult := firstTextResult(result)
+			if textResult == nil {
+				return result, nil, nil
 			}
-			defer func() { _ = resp.Body.Close() }()
 
-			if resp.StatusCode != 200 && resp.StatusCode != 201 {
-				body, err := io.ReadAll(resp.Body)
-				if err != nil {
-					return nil, nil, fmt.Errorf("failed to read response body: %w", err)
+			var structured map[string]any
+			if unmarshalErr := json.Unmarshal([]byte(textResult.Text), &structured); unmarshalErr == nil {
+				structured["source"] = map[string]any{
+					"type":        "shared_path",
+					"shared_path": sharedPath,
+					"size_bytes":  sizeBytes,
 				}
-				return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to create/update file", resp, body), nil, nil
+				result.StructuredContent = structured
 			}
 
-			minimalResponse := convertToMinimalFileContentResponse(fileContent)
-
-			return MarshalledTextResult(minimalResponse), nil, nil
+			return result, nil, nil
 		},
 	)
 }

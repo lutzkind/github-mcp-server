@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1998,6 +2000,163 @@ func Test_CreateOrUpdateFile(t *testing.T) {
 			assert.Equal(t, tc.expectedContent.Commit.Author.GetName(), returnedContent.Commit.Author.Name)
 			assert.Equal(t, tc.expectedContent.Commit.Author.GetEmail(), returnedContent.Commit.Author.Email)
 			assert.NotEmpty(t, returnedContent.Commit.Author.Date)
+		})
+	}
+}
+
+func Test_CreateOrUpdateFileFromSharedPath(t *testing.T) {
+	serverTool := CreateOrUpdateFileFromSharedPath(translations.NullTranslationHelper)
+	tool := serverTool.Tool
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
+
+	schema, ok := tool.InputSchema.(*jsonschema.Schema)
+	require.True(t, ok, "InputSchema should be *jsonschema.Schema")
+
+	assert.Equal(t, "create_or_update_file_from_shared_path", tool.Name)
+	assert.Contains(t, schema.Properties, "shared_path")
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "path", "shared_path", "message", "branch"})
+
+	tempRoot := t.TempDir()
+	t.Setenv("GITHUB_MCP_SHARED_ROOT", tempRoot)
+
+	sharedRelPath := "patches/worker.js"
+	sharedAbsPath := filepath.Join(tempRoot, sharedRelPath)
+	require.NoError(t, os.MkdirAll(filepath.Dir(sharedAbsPath), 0o755))
+	require.NoError(t, os.WriteFile(sharedAbsPath, []byte("console.log('patched worker');\n"), 0o644))
+
+	mockFileResponse := &github.RepositoryContentResponse{
+		Content: &github.RepositoryContent{
+			Name:    github.Ptr("worker.js"),
+			Path:    github.Ptr("src/worker.js"),
+			SHA:     github.Ptr("worker-sha"),
+			Size:    github.Ptr(30),
+			HTMLURL: github.Ptr("https://github.com/owner/repo/blob/feature/src/worker.js"),
+		},
+		Commit: github.Commit{
+			SHA:     github.Ptr("commit-sha"),
+			Message: github.Ptr("Patch worker"),
+			HTMLURL: github.Ptr("https://github.com/owner/repo/commit/commit-sha"),
+			Author: &github.CommitAuthor{
+				Name:  github.Ptr("Test User"),
+				Email: github.Ptr("test@example.com"),
+				Date:  &github.Timestamp{Time: time.Now()},
+			},
+		},
+	}
+
+	tests := []struct {
+		name           string
+		mockedClient   *http.Client
+		requestArgs    map[string]any
+		expectError    bool
+		expectedErrMsg string
+		validate       func(t *testing.T, result *mcp.CallToolResult)
+	}{
+		{
+			name: "successful shared path update",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				"GET /repos/owner/repo/contents/src/worker.js": mockResponse(t, http.StatusOK, &github.RepositoryContent{
+					SHA:  github.Ptr("old-sha"),
+					Type: github.Ptr("file"),
+				}),
+				"GET /repos/{owner}/{repo}/contents/{path:.*}": mockResponse(t, http.StatusOK, &github.RepositoryContent{
+					SHA:  github.Ptr("old-sha"),
+					Type: github.Ptr("file"),
+				}),
+				PutReposContentsByOwnerByRepoByPath: expectRequestBody(t, map[string]any{
+					"message": "Patch worker",
+					"content": base64.StdEncoding.EncodeToString([]byte("console.log('patched worker');\n")),
+					"branch":  "feature/test",
+					"sha":     "old-sha",
+				}).andThen(
+					mockResponse(t, http.StatusOK, mockFileResponse),
+				),
+				"PUT /repos/{owner}/{repo}/contents/{path:.*}": expectRequestBody(t, map[string]any{
+					"message": "Patch worker",
+					"content": base64.StdEncoding.EncodeToString([]byte("console.log('patched worker');\n")),
+					"branch":  "feature/test",
+					"sha":     "old-sha",
+				}).andThen(
+					mockResponse(t, http.StatusOK, mockFileResponse),
+				),
+			}),
+			requestArgs: map[string]any{
+				"owner":       "owner",
+				"repo":        "repo",
+				"path":        "src/worker.js",
+				"shared_path": sharedRelPath,
+				"message":     "Patch worker",
+				"branch":      "feature/test",
+				"sha":         "old-sha",
+			},
+			validate: func(t *testing.T, result *mcp.CallToolResult) {
+				require.NotNil(t, result.StructuredContent)
+				structured, ok := result.StructuredContent.(map[string]any)
+				require.True(t, ok)
+				source, ok := structured["source"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, "shared_path", source["type"])
+				assert.Equal(t, sharedRelPath, source["shared_path"])
+				assert.EqualValues(t, len([]byte("console.log('patched worker');\n")), source["size_bytes"])
+			},
+		},
+		{
+			name:         "reject path traversal",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: map[string]any{
+				"owner":       "owner",
+				"repo":        "repo",
+				"path":        "src/worker.js",
+				"shared_path": "../secrets.txt",
+				"message":     "Patch worker",
+				"branch":      "feature/test",
+			},
+			expectError:    true,
+			expectedErrMsg: "shared_path must stay within the shared directory",
+		},
+		{
+			name:         "reject missing shared file",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: map[string]any{
+				"owner":       "owner",
+				"repo":        "repo",
+				"path":        "src/worker.js",
+				"shared_path": "missing/worker.js",
+				"message":     "Patch worker",
+				"branch":      "feature/test",
+			},
+			expectError:    true,
+			expectedErrMsg: "failed to stat shared file",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := mustNewGHClient(t, tc.mockedClient)
+			deps := BaseDeps{Client: client}
+			handler := serverTool.Handler(deps)
+			request := createMCPRequest(tc.requestArgs)
+
+			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+			require.NoError(t, err)
+
+			if tc.expectError {
+				require.True(t, result.IsError)
+				errorContent := getErrorResult(t, result)
+				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
+				return
+			}
+
+			require.False(t, result.IsError)
+			textContent := getTextResult(t, result)
+			var returnedContent MinimalFileContentResponse
+			err = json.Unmarshal([]byte(textContent.Text), &returnedContent)
+			require.NoError(t, err)
+			assert.Equal(t, "src/worker.js", returnedContent.Content.Path)
+			assert.Equal(t, "commit-sha", returnedContent.Commit.SHA)
+			if tc.validate != nil {
+				tc.validate(t, result)
+			}
 		})
 	}
 }

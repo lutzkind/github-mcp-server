@@ -188,6 +188,7 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		GetLatestRelease(t),
 		GetReleaseByTag(t),
 		CreateOrUpdateFile(t),
+		CreateOrUpdateFileFromSharedPath(t),
 		CreateRepository(t),
 		ForkRepository(t),
 		CreateBranch(t),
