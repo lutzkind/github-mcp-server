@@ -34,6 +34,18 @@ func TestApplyFilePatchUnifiedDiffMultiHunk(t *testing.T) {
 	}
 }
 
+func TestApplyFilePatchUnifiedDiffMayEditFirstLine(t *testing.T) {
+	before := "line 1 old\nline 2 unchanged\n"
+	patch := "@@ -1,2 +1,2 @@\n-line 1 old\n+line 1 new\n line 2 unchanged\n"
+	after, _, err := applyFilePatch(before, filePatchInput{Operation: "unified_diff", Patch: patch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != "line 1 new\nline 2 unchanged\n" {
+		t.Fatalf("unexpected result: %q", after)
+	}
+}
+
 func TestApplyFilePatchRejectsAmbiguousMalformedAndOverlapping(t *testing.T) {
 	if _, _, err := applyFilePatch("x\nx", filePatchInput{Operation: "patch_text", Search: "x", Replace: "y", ExpectedOccurrences: 1}); err == nil {
 		t.Fatal("ambiguous patch was accepted")

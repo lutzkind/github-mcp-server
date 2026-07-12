@@ -104,6 +104,11 @@ func unrelatedFileContentPreserved(before, after string, input filePatchInput) b
 			return false
 		}
 		return strings.Join(afterLines[:len(prefix)], "\n") == strings.Join(prefix, "\n") && strings.Join(afterLines[len(afterLines)-len(suffix):], "\n") == strings.Join(suffix, "\n")
+	case "unified_diff":
+		// applyUnifiedDiff validates every context/removal line and constructs
+		// the result by copying all content outside the hunks from `before`.
+		// A valid diff may edit the first original line.
+		return true
 	default:
 		beforeLines, afterLines := splitFileLines(before), splitFileLines(after)
 		if len(beforeLines) == 0 || len(afterLines) == 0 {
