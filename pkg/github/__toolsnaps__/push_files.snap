@@ -9,6 +9,10 @@
         "description": "Branch to push to",
         "type": "string"
       },
+      "dry_run": {
+        "description": "Validate the request and report what would happen without writing to GitHub",
+        "type": "boolean"
+      },
       "files": {
         "description": "Array of file objects to push, each object with path (string) and content (string)",
         "items": {
@@ -18,14 +22,46 @@
               "description": "file content",
               "type": "string"
             },
+            "end_line": {
+              "type": "integer"
+            },
+            "expected_blob_sha": {
+              "type": "string"
+            },
+            "expected_occurrences": {
+              "type": "integer"
+            },
+            "operation": {
+              "enum": [
+                "replace",
+                "patch_text",
+                "patch_range",
+                "unified_diff"
+              ],
+              "type": "string"
+            },
+            "patch": {
+              "type": "string"
+            },
             "path": {
               "description": "path to the file",
               "type": "string"
+            },
+            "replace": {
+              "type": "string"
+            },
+            "replacement": {
+              "type": "string"
+            },
+            "search": {
+              "type": "string"
+            },
+            "start_line": {
+              "type": "integer"
             }
           },
           "required": [
-            "path",
-            "content"
+            "path"
           ],
           "type": "object"
         },

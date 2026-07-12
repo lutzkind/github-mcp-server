@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -249,7 +250,9 @@ func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
-			commits, resp, err := client.Repositories.ListCommits(ctx, owner, repo, opts)
+			commits, resp, err := retryGitHubCall(ctx, deps, "list_commits", func(callCtx context.Context) ([]*github.RepositoryCommit, *github.Response, error) {
+				return client.Repositories.ListCommits(callCtx, owner, repo, opts)
+			})
 			if err != nil {
 				return ghErrors.NewGitHubAPIErrorResponse(ctx,
 					fmt.Sprintf("failed to list commits: %s", sha),
@@ -417,6 +420,22 @@ SHA MUST be provided for existing file updates.
 						Type:        "string",
 						Description: "Content of the file",
 					},
+					"operation": {
+						Type:        "string",
+						Enum:        []any{"replace", "patch_text", "patch_range", "unified_diff"},
+						Description: "Mutation mode. Omitting this keeps the legacy replace behavior.",
+					},
+					"expected_blob_sha": {
+						Type:        "string",
+						Description: "Current Git blob SHA. Required when modifying an existing file.",
+					},
+					"search":               {Type: "string", Description: "Exact text to find for patch_text."},
+					"replace":              {Type: "string", Description: "Replacement text for patch_text."},
+					"expected_occurrences": {Type: "integer", Description: "Exact number of search matches required."},
+					"start_line":           {Type: "integer", Description: "One-based inclusive start line for patch_range."},
+					"end_line":             {Type: "integer", Description: "One-based inclusive end line for patch_range."},
+					"replacement":          {Type: "string", Description: "Replacement text for patch_range."},
+					"patch":                {Type: "string", Description: "Single-file unified diff for unified_diff."},
 					"message": {
 						Type:        "string",
 						Description: "Commit message",
@@ -429,8 +448,12 @@ SHA MUST be provided for existing file updates.
 						Type:        "string",
 						Description: "The blob SHA of the file being replaced. Required if the file already exists.",
 					},
+					"dry_run": {
+						Type:        "boolean",
+						Description: "Validate the request and report what would happen without writing to GitHub",
+					},
 				},
-				Required: []string{"owner", "repo", "path", "content", "message", "branch"},
+				Required: []string{"owner", "repo", "path", "message", "branch"},
 			},
 		},
 		[]scopes.Scope{scopes.Repo},
@@ -447,7 +470,7 @@ SHA MUST be provided for existing file updates.
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			content, err := RequiredParam[string](args, "content")
+			content, err := OptionalParam[string](args, "content")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -463,11 +486,73 @@ SHA MUST be provided for existing file updates.
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
+			dryRun, err := OptionalParam[bool](args, "dry_run")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			_, operationProvided := args["operation"]
+			operation, err := OptionalParam[string](args, "operation")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			expectedBlobSHA, err := OptionalParam[string](args, "expected_blob_sha")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if expectedBlobSHA == "" {
+				expectedBlobSHA = sha
+			}
+			expectedOccurrences, err := optionalIntArgument(args, "expected_occurrences")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			startLine, err := optionalIntArgument(args, "start_line")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			endLine, err := optionalIntArgument(args, "end_line")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			search, err := OptionalParam[string](args, "search")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			replace, err := OptionalParam[string](args, "replace")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			replacement, err := OptionalParam[string](args, "replacement")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			patch, err := OptionalParam[string](args, "patch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if isSecretLikeRepoPath(path) {
+				return newBlockedFileToolResult(path, "secret_like_file"), nil, nil
+			}
+			if operation == "" {
+				operation = "replace"
+			}
+			if operation == "replace" && content == "" {
+				return utils.NewToolResultError("content is required for replace"), nil, nil
+			}
+			if reason := detectSecretLikeContent(path, content); reason != "" {
+				return newBlockedFileToolResult(path, reason), nil, nil
+			}
 			client, err := deps.GetClient(ctx)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
-			return createOrUpdateFileResult(ctx, deps, client, owner, repo, path, content, message, branch, sha)
+			if !operationProvided && args["expected_blob_sha"] == nil {
+				return createOrUpdateFileResult(ctx, deps, client, owner, repo, path, content, message, branch, sha)
+			}
+			return createOrUpdateFileOperation(ctx, deps, client, owner, repo, path, message, branch, expectedBlobSHA, dryRun, filePatchInput{
+				Operation: operation, Content: content, Search: search, Replace: replace, ExpectedOccurrences: expectedOccurrences,
+				StartLine: startLine, EndLine: endLine, Replacement: replacement, Patch: patch,
+			})
 		},
 	)
 }
@@ -711,7 +796,80 @@ func firstTextResult(result *mcp.CallToolResult) *mcp.TextContent {
 	return nil
 }
 
+type createOrUpdateFilePreview struct {
+	Owner          string `json:"owner"`
+	Repo           string `json:"repo"`
+	Path           string `json:"path"`
+	Branch         string `json:"branch"`
+	Action         string `json:"action"`
+	RequiresSHA    bool   `json:"requires_sha"`
+	CurrentSHA     string `json:"current_sha,omitempty"`
+	DryRun         bool   `json:"dry_run"`
+	SecretsChecked bool   `json:"secrets_checked"`
+}
+
+func preflightCreateOrUpdateFile(ctx context.Context, client *github.Client, owner, repo, path, branch, sha string) (*createOrUpdateFilePreview, *mcp.CallToolResult, error) {
+	path = strings.TrimPrefix(path, "/")
+	getOpts := &github.RepositoryContentGetOptions{Ref: branch}
+
+	preview := &createOrUpdateFilePreview{
+		Owner:          owner,
+		Repo:           repo,
+		Path:           path,
+		Branch:         branch,
+		DryRun:         true,
+		SecretsChecked: true,
+	}
+
+	existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
+	if respCheck != nil {
+		defer func() { _ = respCheck.Body.Close() }()
+	}
+
+	switch {
+	case getErr != nil:
+		if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
+			return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to check if file exists", respCheck, getErr), nil
+		}
+		preview.Action = "create"
+		preview.RequiresSHA = false
+		return preview, nil, nil
+	case dirContent != nil:
+		return nil, utils.NewToolResultError(fmt.Sprintf(
+			"Path %s is a directory, not a file. This tool only works with files.",
+			path,
+		)), nil
+	case existingFile != nil:
+		currentSHA := existingFile.GetSHA()
+		preview.Action = "update"
+		preview.RequiresSHA = true
+		preview.CurrentSHA = currentSHA
+		if sha == "" {
+			return nil, utils.NewToolResultError(fmt.Sprintf(
+				"File already exists at %s. You must provide the current file's SHA when updating. Use git rev-parse %s:%s to get the blob SHA, then retry with the sha parameter.",
+				path, branch, path,
+			)), nil
+		}
+		if currentSHA != sha {
+			return nil, utils.NewToolResultError(fmt.Sprintf(
+				"SHA mismatch: provided SHA %s is stale. Current file SHA is %s. Pull the latest changes and use git rev-parse %s:%s to get the current SHA.",
+				sha, currentSHA, branch, path,
+			)), nil
+		}
+		return preview, nil, nil
+	}
+
+	return nil, utils.NewToolResultError("failed to prepare file update"), nil
+}
+
 func createOrUpdateFileResult(ctx context.Context, deps ToolDependencies, client *github.Client, owner, repo, path, content, message, branch, sha string) (*mcp.CallToolResult, any, error) {
+	if isSecretLikeRepoPath(path) {
+		return newBlockedFileToolResult(path, "secret_like_file"), nil, nil
+	}
+	if reason := detectSecretLikeContent(path, content); reason != "" {
+		return newBlockedFileToolResult(path, reason), nil, nil
+	}
+
 	// json.Marshal encodes byte arrays with base64, which is required for the API.
 	contentBytes := []byte(content)
 
@@ -726,59 +884,8 @@ func createOrUpdateFileResult(ctx context.Context, deps ToolDependencies, client
 	}
 
 	path = strings.TrimPrefix(path, "/")
-	getOpts := &github.RepositoryContentGetOptions{Ref: branch}
-
-	if sha != "" {
-		existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
-		if respCheck != nil {
-			_ = respCheck.Body.Close()
-		}
-		switch {
-		case getErr != nil:
-			if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
-				return ghErrors.NewGitHubAPIErrorResponse(ctx,
-					"failed to verify file SHA",
-					respCheck,
-					getErr,
-				), nil, nil
-			}
-		case dirContent != nil:
-			return utils.NewToolResultError(fmt.Sprintf(
-				"Path %s is a directory, not a file. This tool only works with files.",
-				path)), nil, nil
-		case existingFile != nil:
-			currentSHA := existingFile.GetSHA()
-			if currentSHA != sha {
-				return utils.NewToolResultError(fmt.Sprintf(
-					"SHA mismatch: provided SHA %s is stale. Current file SHA is %s. "+
-						"Pull the latest changes and use git rev-parse %s:%s to get the current SHA.",
-					sha, currentSHA, branch, path)), nil, nil
-			}
-		}
-	} else {
-		existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
-		if respCheck != nil {
-			_ = respCheck.Body.Close()
-		}
-		switch {
-		case getErr != nil:
-			if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
-				return ghErrors.NewGitHubAPIErrorResponse(ctx,
-					"failed to check if file exists",
-					respCheck,
-					getErr,
-				), nil, nil
-			}
-		case dirContent != nil:
-			return utils.NewToolResultError(fmt.Sprintf(
-				"Path %s is a directory, not a file. This tool only works with files.",
-				path)), nil, nil
-		case existingFile != nil:
-			return utils.NewToolResultError(fmt.Sprintf(
-				"File already exists at %s. You must provide the current file's SHA when updating. "+
-					"Use git rev-parse %s:%s to get the blob SHA, then retry with the sha parameter.",
-				path, branch, path)), nil, nil
-		}
+	if _, previewResult, previewErr := preflightCreateOrUpdateFile(ctx, client, owner, repo, path, branch, sha); previewResult != nil || previewErr != nil {
+		return previewResult, nil, previewErr
 	}
 
 	fileContent, resp, err := client.Repositories.CreateFile(ctx, owner, repo, path, opts)
@@ -801,6 +908,137 @@ func createOrUpdateFileResult(ctx context.Context, deps ToolDependencies, client
 
 	minimalResponse := convertToMinimalFileContentResponse(fileContent)
 	return MarshalledTextResult(minimalResponse), nil, nil
+}
+
+func decodeGitHubFileContent(file *github.RepositoryContent) (string, error) {
+	if file == nil || file.Content == nil {
+		return "", fmt.Errorf("GitHub did not return complete file content")
+	}
+	encodedContent, err := file.GetContent()
+	if err != nil {
+		return "", fmt.Errorf("failed to read current GitHub blob content: %w", err)
+	}
+	return encodedContent, nil
+}
+
+func boundedRedactedPreview(content string) string {
+	redacted, _ := redactSecretLikeContent(content)
+	if len(redacted) > 4000 {
+		return redacted[:4000] + "\n...[truncated]"
+	}
+	return redacted
+}
+
+func optionalIntArgument(args map[string]any, key string) (int, error) {
+	value, ok := args[key]
+	if !ok || value == nil {
+		return 0, nil
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed, nil
+	case int64:
+		return int(typed), nil
+	case float64:
+		if typed != float64(int(typed)) {
+			return 0, fmt.Errorf("parameter %s must be an integer", key)
+		}
+		return int(typed), nil
+	default:
+		return 0, fmt.Errorf("parameter %s is not of type int, is %T", key, value)
+	}
+}
+
+func getCurrentGitHubFile(ctx context.Context, client *github.Client, owner, repo, path, branch string) (*github.RepositoryContent, string, *github.Response, error) {
+	file, dirs, resp, err := client.Repositories.GetContents(ctx, owner, repo, strings.TrimPrefix(path, "/"), &github.RepositoryContentGetOptions{Ref: branch})
+	if err != nil {
+		return nil, "", resp, err
+	}
+	if dirs != nil {
+		return nil, "", resp, fmt.Errorf("path %s is a directory, not a file", path)
+	}
+	content, err := decodeGitHubFileContent(file)
+	if err != nil {
+		return file, "", resp, err
+	}
+	return file, content, resp, nil
+}
+
+func createOrUpdateFileOperation(ctx context.Context, deps ToolDependencies, client *github.Client, owner, repo, path, message, branch, expectedSHA string, dryRun bool, patch filePatchInput) (*mcp.CallToolResult, any, error) {
+	path = strings.TrimPrefix(path, "/")
+	file, before, resp, err := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	exists := err == nil && file != nil
+	if err != nil && (resp == nil || resp.StatusCode != http.StatusNotFound) {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to fetch current file before mutation", resp, err), nil, nil
+	}
+	if !exists && patch.Operation != "replace" {
+		return utils.NewToolResultError("patch operations require an existing file"), nil, nil
+	}
+	if exists {
+		if expectedSHA == "" {
+			return utils.NewToolResultError(fmt.Sprintf("File already exists at %s. You must provide expected_blob_sha when modifying it.", path)), nil, nil
+		}
+		if expectedSHA != file.GetSHA() {
+			return utils.NewToolResultError(fmt.Sprintf("SHA mismatch: provided SHA %s is stale. Current file SHA is %s.", expectedSHA, file.GetSHA())), nil, nil
+		}
+	}
+	if patch.Operation == "replace" && !exists {
+		before = ""
+	}
+	after, patchPreview, err := applyFilePatch(before, patch)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	if reason := detectSecretLikeContent(path, after); reason != "" {
+		return newBlockedFileToolResult(path, reason), nil, nil
+	}
+	if !unrelatedFileContentPreserved(before, after, patch) {
+		return utils.NewToolResultError("resulting file did not preserve unrelated content"), nil, nil
+	}
+	redactedBefore, _ := redactSecretLikeContent(before)
+	redactedAfter, _ := redactSecretLikeContent(after)
+	bounded := func(value string) string {
+		if len(value) > 4000 {
+			return value[:4000] + "\n...[truncated]"
+		}
+		return value
+	}
+	preview := map[string]any{
+		"ok": true, "dry_run": dryRun, "operation": patchPreview.Operation, "owner": owner, "repo": repo, "path": path, "branch": branch,
+		"action": map[bool]string{true: "update", false: "create"}[exists], "expected_blob_sha": expectedSHA, "matched_occurrences": patchPreview.MatchedOccurrences,
+		"changed_line_count": patchPreview.ChangedLineCount, "hunks": patchPreview.Hunks, "before_preview": bounded(redactedBefore), "after_preview": bounded(redactedAfter), "redacted": redactedBefore != before || redactedAfter != after,
+	}
+	if dryRun {
+		return MarshalledTextResult(preview), nil, nil
+	}
+	options := &github.RepositoryContentFileOptions{Message: github.Ptr(message), Content: []byte(after), Branch: github.Ptr(branch)}
+	if exists {
+		options.SHA = github.Ptr(expectedSHA)
+	}
+	committed, writeResp, err := client.Repositories.CreateFile(ctx, owner, repo, path, options)
+	if writeResp != nil && writeResp.Body != nil {
+		defer func() { _ = writeResp.Body.Close() }()
+	}
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create/update file", writeResp, err), nil, nil
+	}
+	verified, committedContent, verifyResp, err := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+	if verifyResp != nil && verifyResp.Body != nil {
+		defer func() { _ = verifyResp.Body.Close() }()
+	}
+	if err != nil {
+		return utils.NewToolResultError(fmt.Sprintf("post-commit verification failed: %v", err)), nil, nil
+	}
+	if committedContent != after {
+		return utils.NewToolResultError("post-commit verification failed: committed content does not match the requested change"), nil, nil
+	}
+	if exists && verified.GetSHA() == expectedSHA {
+		return utils.NewToolResultError("post-commit verification failed: blob SHA did not change"), nil, nil
+	}
+	return MarshalledTextResult(map[string]any{"ok": true, "applied": true, "verification": map[string]any{"ok": true, "exact_content": true, "unrelated_content_preserved": true}, "content": convertToMinimalFileContentResponse(committed)}), nil, nil
 }
 
 func CreateOrUpdateFileFromSharedPath(t translations.TranslationHelperFunc) inventory.ServerTool {
@@ -1158,6 +1396,80 @@ func isSecretLikeRepoPath(path string) bool {
 	}
 }
 
+var secretLikeContentPatterns = []struct {
+	reason string
+	regex  *regexp.Regexp
+}{
+	{reason: "private_key_material", regex: regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)},
+	{reason: "github_token", regex: regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`)},
+	{reason: "aws_access_key", regex: regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
+	{reason: "openai_api_key", regex: regexp.MustCompile(`\bsk-(?:live|proj|ant)-[A-Za-z0-9]{16,}\b`)},
+	{reason: "slack_token", regex: regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}\b`)},
+}
+
+var secretRedactionPatterns = []struct {
+	regex       *regexp.Regexp
+	replacement string
+}{
+	{
+		regex:       regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`),
+		replacement: "***REDACTED PRIVATE KEY***",
+	},
+	{
+		regex:       regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`),
+		replacement: "***REDACTED GITHUB TOKEN***",
+	},
+	{
+		regex:       regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+		replacement: "***REDACTED AWS KEY***",
+	},
+	{
+		regex:       regexp.MustCompile(`\bsk-(?:live|proj|ant)-[A-Za-z0-9]{16,}\b`),
+		replacement: "***REDACTED API KEY***",
+	},
+	{
+		regex:       regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}\b`),
+		replacement: "***REDACTED SLACK TOKEN***",
+	},
+	{
+		regex:       regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._\-+/=]{12,}\b`),
+		replacement: "Bearer ***REDACTED***",
+	},
+	{
+		regex:       regexp.MustCompile(`(?im)^([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*[:=]\s*).+$`),
+		replacement: "${1}***REDACTED***",
+	},
+	{
+		regex:       regexp.MustCompile(`(?i)\b((?:access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|webhook[_-]?secret|password|private[_-]?key)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^'",\s]+)`),
+		replacement: "${1}***REDACTED***",
+	},
+}
+
+func detectSecretLikeContent(path, content string) string {
+	if isSecretLikeRepoPath(path) {
+		return "secret_like_file"
+	}
+	for _, pattern := range secretLikeContentPatterns {
+		if pattern.regex.MatchString(content) {
+			return pattern.reason
+		}
+	}
+	return ""
+}
+
+func redactSecretLikeContent(content string) (string, bool) {
+	redacted := content
+	changed := false
+	for _, pattern := range secretRedactionPatterns {
+		next := pattern.regex.ReplaceAllString(redacted, pattern.replacement)
+		if next != redacted {
+			changed = true
+			redacted = next
+		}
+	}
+	return redacted, changed
+}
+
 func detectFileMimeType(path, fallback string) string {
 	if strings.EqualFold(filepath.Base(path), "Dockerfile") {
 		return "text/x-dockerfile"
@@ -1435,10 +1747,19 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 			opts := &github.RepositoryContentGetOptions{Ref: ref}
 
 			// Always call GitHub Contents API first to get metadata including SHA and determine if it's a file or directory
-			fileContent, dirContent, respContents, err := client.Repositories.GetContents(ctx, owner, repo, path, opts)
+			type contentsResult struct {
+				fileContent *github.RepositoryContent
+				dirContent  []*github.RepositoryContent
+			}
+			contents, respContents, err := retryGitHubCall(ctx, deps, "get_file_contents:GetContents", func(callCtx context.Context) (contentsResult, *github.Response, error) {
+				fileContent, dirContent, respContents, err := client.Repositories.GetContents(callCtx, owner, repo, path, opts)
+				return contentsResult{fileContent: fileContent, dirContent: dirContent}, respContents, err
+			})
 			if respContents != nil {
 				defer func() { _ = respContents.Body.Close() }()
 			}
+			fileContent := contents.fileContent
+			dirContent := contents.dirContent
 
 			// The path does not point to a file or directory.
 			// Instead let's try to find it in the Git Tree by matching the end of the path.
@@ -1481,7 +1802,9 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 					if rawErr != nil {
 						return utils.NewToolResultError(fmt.Sprintf("failed to get GitHub raw content client: %s", rawErr)), nil, nil
 					}
-					rawResp, rawErr := rawClient.GetRawContent(ctx, owner, repo, path, rawOpts)
+					rawResp, rawErr := retryGitHubHTTPCall(ctx, deps, "get_file_contents:GetRawContent", func(callCtx context.Context) (*http.Response, error) {
+						return rawClient.GetRawContent(callCtx, owner, repo, path, rawOpts)
+					})
 					if rawErr != nil {
 						return utils.NewToolResultError(fmt.Sprintf("failed to fetch raw file content: %s", rawErr)), nil, nil
 					}
@@ -1513,7 +1836,13 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 				if startLine > 0 || endLine > 0 {
 					var truncated bool
 					content, startLine, endLine, truncated = sliceTextByLines(content, startLine, endLine)
+					content, redacted := redactSecretLikeContent(content)
 					result := newInlineFileToolResult(owner, repo, path, rawOpts.Ref, fileSHA, contentType, content, startLine, endLine, truncated)
+					if redacted {
+						if structured, ok := result.StructuredContent.(map[string]any); ok {
+							structured["redacted"] = true
+						}
+					}
 					if successNote != "" {
 						text := result.Content[0].(*mcp.TextContent)
 						text.Text = strings.Replace(text.Text, "\n\n```", fmt.Sprintf("%s\n\n```", successNote), 1)
@@ -1525,7 +1854,13 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 					maxBytes = 128 * 1024
 				}
 				content, truncated := trimTextByBytes(content, maxBytes)
+				content, redacted := redactSecretLikeContent(content)
 				result := newInlineFileToolResult(owner, repo, path, rawOpts.Ref, fileSHA, contentType, content, 1, strings.Count(content, "\n")+1, truncated)
+				if redacted {
+					if structured, ok := result.StructuredContent.(map[string]any); ok {
+						structured["redacted"] = true
+					}
+				}
 				if successNote != "" {
 					text := result.Content[0].(*mcp.TextContent)
 					text.Text = strings.Replace(text.Text, "\n\n```", fmt.Sprintf("%s\n\n```", successNote), 1)
@@ -1983,13 +2318,26 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 									Type:        "string",
 									Description: "file content",
 								},
+								"operation":            {Type: "string", Enum: []any{"replace", "patch_text", "patch_range", "unified_diff"}},
+								"expected_blob_sha":    {Type: "string"},
+								"search":               {Type: "string"},
+								"replace":              {Type: "string"},
+								"expected_occurrences": {Type: "integer"},
+								"start_line":           {Type: "integer"},
+								"end_line":             {Type: "integer"},
+								"replacement":          {Type: "string"},
+								"patch":                {Type: "string"},
 							},
-							Required: []string{"path", "content"},
+							Required: []string{"path"},
 						},
 					},
 					"message": {
 						Type:        "string",
 						Description: "Commit message",
+					},
+					"dry_run": {
+						Type:        "boolean",
+						Description: "Validate the request and report what would happen without writing to GitHub",
 					},
 				},
 				Required: []string{"owner", "repo", "branch", "files", "message"},
@@ -2010,6 +2358,10 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			message, err := RequiredParam[string](args, "message")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			dryRun, err := OptionalParam[bool](args, "dry_run")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -2096,6 +2448,8 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 			// Create tree entries for all files (or remaining files if empty repo)
 			var entries []*github.TreeEntry
 
+			changedPaths := make([]string, 0, len(filesObj))
+			patchPreviews := make([]any, 0)
 			for _, file := range filesObj {
 				fileMap, ok := file.(map[string]any)
 				if !ok {
@@ -2107,9 +2461,56 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 					return utils.NewToolResultError("each file must have a path"), nil, nil
 				}
 
-				content, ok := fileMap["content"].(string)
-				if !ok {
+				content, hasContent := fileMap["content"].(string)
+				rawOperation, operationProvided := fileMap["operation"]
+				operation, _ := rawOperation.(string)
+				if operation == "" {
+					operation = "replace"
+				}
+				if !hasContent && operation == "replace" {
 					return utils.NewToolResultError("each file must have content"), nil, nil
+				}
+				expectedSHA, expectedBlobProvided := fileMap["expected_blob_sha"].(string)
+				if expectedSHA == "" {
+					expectedSHA, _ = fileMap["sha"].(string)
+				}
+				if operationProvided || expectedBlobProvided {
+					current, currentContent, currentResp, currentErr := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+					if currentResp != nil && currentResp.Body != nil {
+						_ = currentResp.Body.Close()
+					}
+					if currentErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to fetch %s before patch: %v", path, currentErr)), nil, nil
+					}
+					if expectedSHA == "" {
+						return utils.NewToolResultError(fmt.Sprintf("expected_blob_sha is required for existing file %s", path)), nil, nil
+					}
+					if current.GetSHA() != expectedSHA {
+						return utils.NewToolResultError(fmt.Sprintf("SHA mismatch for %s: provided %s, current %s", path, expectedSHA, current.GetSHA())), nil, nil
+					}
+					occurrences, _ := optionalIntArgument(fileMap, "expected_occurrences")
+					startLine, _ := optionalIntArgument(fileMap, "start_line")
+					endLine, _ := optionalIntArgument(fileMap, "end_line")
+					search, _ := fileMap["search"].(string)
+					replace, _ := fileMap["replace"].(string)
+					replacement, _ := fileMap["replacement"].(string)
+					patchText, _ := fileMap["patch"].(string)
+					patchInput := filePatchInput{Operation: operation, Content: content, Search: search, Replace: replace, ExpectedOccurrences: occurrences, StartLine: startLine, EndLine: endLine, Replacement: replacement, Patch: patchText}
+					nextContent, patchPreview, patchErr := applyFilePatch(currentContent, patchInput)
+					if patchErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("%s: %v", path, patchErr)), nil, nil
+					}
+					if !unrelatedFileContentPreserved(currentContent, nextContent, patchInput) {
+						return utils.NewToolResultError(fmt.Sprintf("%s: unrelated content was not preserved", path)), nil, nil
+					}
+					content = nextContent
+					patchPreviews = append(patchPreviews, map[string]any{"path": path, "operation": operation, "expected_blob_sha": expectedSHA, "matched_occurrences": patchPreview.MatchedOccurrences, "hunks": patchPreview.Hunks, "before_preview": boundedRedactedPreview(currentContent), "after_preview": boundedRedactedPreview(nextContent)})
+				}
+				if isSecretLikeRepoPath(path) {
+					return newBlockedFileToolResult(path, "secret_like_file"), nil, nil
+				}
+				if reason := detectSecretLikeContent(path, content); reason != "" {
+					return newBlockedFileToolResult(path, reason), nil, nil
 				}
 
 				// Create a tree entry for the file
@@ -2119,6 +2520,16 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 					Type:    github.Ptr("blob"),
 					Content: github.Ptr(content),
 				})
+				changedPaths = append(changedPaths, path)
+			}
+
+			if dryRun {
+				return MarshalledTextResult(map[string]any{
+					"branch":         branch,
+					"changed_paths":  changedPaths,
+					"file_count":     len(changedPaths),
+					"patch_previews": patchPreviews,
+				}), nil, nil
 			}
 
 			// Create a new tree with the file entries (baseCommit is now guaranteed to exist)

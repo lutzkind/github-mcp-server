@@ -258,7 +258,9 @@ func SearchCode(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return utils.NewToolResultErrorFromErr("failed to get GitHub client", err), nil, nil
 			}
 
-			result, resp, err := client.Search.Code(ctx, query, opts)
+			result, resp, err := retryGitHubCall(ctx, deps, "search_code", func(callCtx context.Context) (*github.CodeSearchResult, *github.Response, error) {
+				return client.Search.Code(callCtx, query, opts)
+			})
 			if err != nil {
 				return ghErrors.NewGitHubAPIErrorResponse(ctx,
 					fmt.Sprintf("failed to search code with query '%s'", query),
@@ -278,11 +280,26 @@ func SearchCode(t translations.TranslationHelperFunc) inventory.ServerTool {
 
 			minimalItems := make([]MinimalCodeResult, 0, len(result.CodeResults))
 			for _, code := range result.CodeResults {
+				var textMatches []*github.TextMatch
+				if len(code.TextMatches) > 0 {
+					textMatches = make([]*github.TextMatch, 0, len(code.TextMatches))
+					for _, match := range code.TextMatches {
+						if match == nil {
+							continue
+						}
+						cloned := *match
+						fragment, redacted := redactSecretLikeContent(match.GetFragment())
+						if redacted {
+							cloned.Fragment = github.Ptr(fragment)
+						}
+						textMatches = append(textMatches, &cloned)
+					}
+				}
 				item := MinimalCodeResult{
 					Name:        code.GetName(),
 					Path:        code.GetPath(),
 					SHA:         code.GetSHA(),
-					TextMatches: code.TextMatches,
+					TextMatches: textMatches,
 				}
 				if code.Repository != nil {
 					item.Repository = code.Repository.GetFullName()

@@ -1656,7 +1656,7 @@ func Test_CreateOrUpdateFile(t *testing.T) {
 	assert.Contains(t, schema.Properties, "message")
 	assert.Contains(t, schema.Properties, "branch")
 	assert.Contains(t, schema.Properties, "sha")
-	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "path", "content", "message", "branch"})
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "path", "message", "branch"})
 
 	// Setup mock file content response
 	mockFileResponse := &github.RepositoryContentResponse{
