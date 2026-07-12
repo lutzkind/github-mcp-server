@@ -389,7 +389,7 @@ func CreateOrUpdateFile(t translations.TranslationHelperFunc) inventory.ServerTo
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name: "create_or_update_file",
-			Description: t("TOOL_CREATE_OR_UPDATE_FILE_DESCRIPTION", `Create or update a single file in a GitHub repository. 
+			Description: t("TOOL_CREATE_OR_UPDATE_FILE_DESCRIPTION", `Create or update a single file in a GitHub repository. Supports guarded patch_text, patch_range, and unified_diff operations with expected_blob_sha, expected_occurrences, dry_run preview, and exact content-preservation checks.
 If updating, you should provide the SHA of the file you want to update. Use this tool to create or update a file in a GitHub repository remotely; do not use it for local file operations.
 
 In order to obtain the SHA of original file version before updating, use the following git command:
@@ -2283,7 +2283,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "push_files",
-			Description: t("TOOL_PUSH_FILES_DESCRIPTION", "Push multiple files to a GitHub repository in a single commit"),
+			Description: t("TOOL_PUSH_FILES_DESCRIPTION", "Push multiple files to a GitHub repository in a single atomic commit. Each file supports replace, patch_text, patch_range, and unified_diff with expected_blob_sha and expected_occurrences; dry_run previews the complete multi-file patch and any failed expectation prevents a commit."),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_PUSH_FILES_USER_TITLE", "Push files to repository"),
 				ReadOnlyHint: false,
