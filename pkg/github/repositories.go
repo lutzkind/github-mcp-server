@@ -2403,6 +2403,9 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 			if resp != nil && resp.Body != nil {
 				defer func() { _ = resp.Body.Close() }()
 			}
+			if dryRun && (repositoryIsEmpty || branchNotFound) {
+				return MarshalledTextResult(map[string]any{"branch": branch, "changed_paths": []string{}, "file_count": len(filesObj), "patch_previews": []any{}, "dry_run": true, "branch_exists": false}), nil, nil
+			}
 
 			var baseCommit *github.Commit
 			if !repositoryIsEmpty {
@@ -2450,6 +2453,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 
 			changedPaths := make([]string, 0, len(filesObj))
 			patchPreviews := make([]any, 0)
+			expectedAfter := make(map[string]string)
 			for _, file := range filesObj {
 				fileMap, ok := file.(map[string]any)
 				if !ok {
@@ -2504,6 +2508,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 						return utils.NewToolResultError(fmt.Sprintf("%s: unrelated content was not preserved", path)), nil, nil
 					}
 					content = nextContent
+					expectedAfter[path] = content
 					patchPreviews = append(patchPreviews, map[string]any{"path": path, "operation": operation, "expected_blob_sha": expectedSHA, "matched_occurrences": patchPreview.MatchedOccurrences, "hunks": patchPreview.Hunks, "before_preview": boundedRedactedPreview(currentContent), "after_preview": boundedRedactedPreview(nextContent)})
 				}
 				if isSecretLikeRepoPath(path) {
@@ -2577,6 +2582,19 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 				), nil, nil
 			}
 			defer func() { _ = resp.Body.Close() }()
+			mismatches := make([]any, 0)
+			for path, expected := range expectedAfter {
+				_, actual, verifyResp, verifyErr := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+				if verifyResp != nil && verifyResp.Body != nil {
+					_ = verifyResp.Body.Close()
+				}
+				if verifyErr != nil || actual != expected {
+					mismatches = append(mismatches, map[string]any{"path": path, "requested": "exact_content", "actual": "mismatch"})
+				}
+			}
+			if len(mismatches) > 0 {
+				return utils.NewToolResultError("post-commit verification failed for one or more patched files"), nil, nil
+			}
 
 			r, err := json.Marshal(updatedRef)
 			if err != nil {
