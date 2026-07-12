@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	ghErrors "github.com/github/github-mcp-server/pkg/errors"
@@ -1025,12 +1026,24 @@ func createOrUpdateFileOperation(ctx context.Context, deps ToolDependencies, cli
 	if err != nil {
 		return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create/update file", writeResp, err), nil, nil
 	}
-	verified, committedContent, verifyResp, err := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
-	if verifyResp != nil && verifyResp.Body != nil {
-		defer func() { _ = verifyResp.Body.Close() }()
+	var verified *github.RepositoryContent
+	var committedContent string
+	var verifyErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		var verifyResp *github.Response
+		verified, committedContent, verifyResp, verifyErr = getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+		if verifyResp != nil && verifyResp.Body != nil {
+			_ = verifyResp.Body.Close()
+		}
+		if verifyErr == nil && committedContent == after {
+			break
+		}
+		if attempt < 4 {
+			time.Sleep(250 * time.Millisecond)
+		}
 	}
-	if err != nil {
-		return utils.NewToolResultError(fmt.Sprintf("post-commit verification failed: %v", err)), nil, nil
+	if verifyErr != nil {
+		return utils.NewToolResultError(fmt.Sprintf("post-commit verification failed: %v", verifyErr)), nil, nil
 	}
 	if committedContent != after {
 		return utils.NewToolResultError("post-commit verification failed: committed content does not match the requested change"), nil, nil
