@@ -569,6 +569,94 @@ func Test_UpdatePullRequest_Draft(t *testing.T) {
 	}
 }
 
+func Test_UpdatePullRequestStateExtension(t *testing.T) {
+	serverTool := UpdatePullRequest(translations.NullTranslationHelper)
+
+	tests := []struct {
+		name          string
+		requestState  string
+		finalState    string
+		expectedState string
+	}{
+		{name: "close an open PR", requestState: "closed", finalState: "closed", expectedState: "closed"},
+		{name: "reopen a closed PR", requestState: "open", finalState: "open", expectedState: "open"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			patchSeen := false
+			restClient := mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				PatchReposPullsByOwnerByRepoByPullNumber: func(w http.ResponseWriter, r *http.Request) {
+					patchSeen = true
+					var body map[string]any
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+					assert.Equal(t, tc.requestState, body["state"])
+					assert.NotContains(t, body, "title")
+					assert.NotContains(t, body, "body")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"id":42,"html_url":"https://github.com/owner/repo/pull/42","state":"` + tc.finalState + `"}`))
+				},
+				GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, `{"id":42,"html_url":"https://github.com/owner/repo/pull/42","state":"`+tc.finalState+`"}`),
+			}))
+			deps := BaseDeps{Client: restClient}
+			request := createMCPRequest(map[string]any{
+				"owner":      "owner",
+				"repo":       "repo",
+				"pullNumber": float64(42),
+				"state":      tc.requestState,
+			})
+
+			result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), &request)
+			require.NoError(t, err)
+			require.False(t, result.IsError)
+			assert.True(t, patchSeen)
+
+			var response struct {
+				ID    string `json:"id"`
+				URL   string `json:"url"`
+				State string `json:"state"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(getTextResult(t, result).Text), &response))
+			assert.Equal(t, "42", response.ID)
+			assert.Equal(t, "https://github.com/owner/repo/pull/42", response.URL)
+			assert.Equal(t, tc.expectedState, response.State)
+		})
+	}
+}
+
+func Test_UpdatePullRequestStateOnlyPreservesExistingFields(t *testing.T) {
+	serverTool := UpdatePullRequest(translations.NullTranslationHelper)
+	restClient := mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+		PatchReposPullsByOwnerByRepoByPullNumber: func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			assert.Equal(t, map[string]any{"state": "closed"}, body)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":42,"html_url":"https://github.com/owner/repo/pull/42","state":"closed"}`))
+		},
+		GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, `{"id":42,"html_url":"https://github.com/owner/repo/pull/42","state":"closed"}`),
+	}))
+	deps := BaseDeps{Client: restClient}
+	request := createMCPRequest(map[string]any{
+		"owner":      "owner",
+		"repo":       "repo",
+		"pullNumber": float64(42),
+		"state":      "closed",
+	})
+
+	result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+
+	var response struct {
+		State string `json:"state"`
+		URL   string `json:"url"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(getTextResult(t, result).Text), &response))
+	assert.Equal(t, "closed", response.State)
+	assert.Equal(t, "https://github.com/owner/repo/pull/42", response.URL)
+}
+
 func Test_ListPullRequests(t *testing.T) {
 	// Verify tool definition once
 	serverTool := ListPullRequests(translations.NullTranslationHelper)

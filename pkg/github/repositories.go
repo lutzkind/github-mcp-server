@@ -384,6 +384,259 @@ func ListBranches(t translations.TranslationHelperFunc) inventory.ServerTool {
 	)
 }
 
+type ManageBranchResponse struct {
+	Action            string `json:"action"`
+	Branch            string `json:"branch"`
+	ResolvedSourceSHA string `json:"resolved_source_sha,omitempty"`
+	CreatedBranchSHA  string `json:"created_branch_sha,omitempty"`
+	PriorHeadSHA      string `json:"prior_head_sha,omitempty"`
+}
+
+func ManageBranch(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name:        "manage_branch",
+			Description: t("TOOL_MANAGE_BRANCH_DESCRIPTION", "Create or delete a GitHub repository branch with explicit source and head SHA safety checks."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_MANAGE_BRANCH_USER_TITLE", "Manage branch"),
+				ReadOnlyHint:    false,
+				DestructiveHint: github.Ptr(true),
+			},
+			InputSchema: &jsonschema.Schema{
+				Type:                 "object",
+				AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+				Properties: map[string]*jsonschema.Schema{
+					"owner":        {Type: "string", Description: "Repository owner"},
+					"repo":         {Type: "string", Description: "Repository name"},
+					"action":       {Type: "string", Enum: []any{"create", "delete"}, Description: "Branch action to perform"},
+					"branch":       {Type: "string", Description: "Branch name to create or delete"},
+					"source_ref":   {Type: "string", Description: "Source branch name, tag name, or full commit SHA. Required for create."},
+					"expected_sha": {Type: "string", Description: "Expected full commit SHA for the resolved source on create, or current branch head on delete."},
+				},
+				Required: []string{"owner", "repo", "action", "branch"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			action, err := RequiredParam[string](args, "action")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			branch, err := RequiredParam[string](args, "branch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			sourceRef, err := OptionalParam[string](args, "source_ref")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			expectedSHA, err := OptionalParam[string](args, "expected_sha")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if err := validateBranchName(branch); err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if expectedSHA != "" && !looksLikeSHA(expectedSHA) {
+				return utils.NewToolResultError("expected_sha must be a full 40-character commit SHA"), nil, nil
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+
+			switch action {
+			case "create":
+				if strings.TrimSpace(sourceRef) == "" {
+					return utils.NewToolResultError("source_ref is required for create"), nil, nil
+				}
+				existing, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+				closeResponse(resp)
+				if err == nil && existing != nil {
+					return utils.NewToolResultError(fmt.Sprintf("branch %q already exists", branch)), nil, nil
+				}
+				if err != nil && !githubStatusIs(err, http.StatusNotFound) {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to check destination branch", resp, err), nil, nil
+				}
+
+				resolvedSHA, apiResult, err := resolveCommitishToCommitSHA(ctx, client, owner, repo, sourceRef)
+				if apiResult != nil || err != nil {
+					return apiResult, nil, err
+				}
+				if expectedSHA != "" && resolvedSHA != expectedSHA {
+					return utils.NewToolResultError(fmt.Sprintf("expected_sha mismatch: resolved source SHA is %s", resolvedSHA)), nil, nil
+				}
+
+				createdRef, resp, err := client.Git.CreateRef(ctx, owner, repo, github.CreateRef{
+					Ref: "refs/heads/" + branch,
+					SHA: resolvedSHA,
+				})
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create branch", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				return MarshalledTextResult(ManageBranchResponse{
+					Action:            "create",
+					Branch:            branch,
+					ResolvedSourceSHA: resolvedSHA,
+					CreatedBranchSHA:  createdRef.GetObject().GetSHA(),
+				}), nil, nil
+			case "delete":
+				repository, resp, err := client.Repositories.Get(ctx, owner, repo)
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get repository", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				if repository.GetDefaultBranch() == branch {
+					return utils.NewToolResultError("refusing to delete the repository default branch"), nil, nil
+				}
+
+				ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get branch reference", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				prs, resp, err := client.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
+					State: "open",
+					Head:  owner + ":" + branch,
+				})
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to check open pull requests for branch", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				if len(prs) > 0 {
+					return utils.NewToolResultError("refusing to delete branch with an open pull request"), nil, nil
+				}
+				priorHead := ref.GetObject().GetSHA()
+				if expectedSHA != "" && priorHead != expectedSHA {
+					return utils.NewToolResultError(fmt.Sprintf("expected_sha mismatch: current branch head is %s", priorHead)), nil, nil
+				}
+				resp, err = client.Git.DeleteRef(ctx, owner, repo, "heads/"+branch)
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to delete branch", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				return MarshalledTextResult(ManageBranchResponse{
+					Action:       "delete",
+					Branch:       branch,
+					PriorHeadSHA: priorHead,
+				}), nil, nil
+			default:
+				return utils.NewToolResultError(fmt.Sprintf("unknown action: %s", action)), nil, nil
+			}
+		},
+	)
+}
+
+type RepositoryChange struct {
+	Path            string
+	Operation       string
+	Content         string
+	HasContent      bool
+	ExpectedBlobSHA string
+}
+
+type ApplyRepositoryChangesResponse struct {
+	PreviousHeadSHA string   `json:"previous_head_sha"`
+	NewCommitSHA    string   `json:"new_commit_sha"`
+	NewTreeSHA      string   `json:"new_tree_sha"`
+	AddedPaths      []string `json:"added_paths"`
+	UpdatedPaths    []string `json:"updated_paths"`
+	DeletedPaths    []string `json:"deleted_paths"`
+}
+
+func ApplyRepositoryChanges(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name:        "apply_repository_changes",
+			Description: t("TOOL_APPLY_REPOSITORY_CHANGES_DESCRIPTION", "Apply multiple file additions, updates, and deletions to a repository branch in one atomic commit."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_APPLY_REPOSITORY_CHANGES_USER_TITLE", "Apply repository changes"),
+				ReadOnlyHint:    false,
+				DestructiveHint: github.Ptr(true),
+			},
+			InputSchema: &jsonschema.Schema{
+				Type:                 "object",
+				AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+				Properties: map[string]*jsonschema.Schema{
+					"owner":             {Type: "string", Description: "Repository owner"},
+					"repo":              {Type: "string", Description: "Repository name"},
+					"branch":            {Type: "string", Description: "Branch to update"},
+					"message":           {Type: "string", Description: "Commit message"},
+					"expected_head_sha": {Type: "string", Description: "Expected current branch head full commit SHA"},
+					"changes": {
+						Type:        "array",
+						Description: "File changes to apply in one commit",
+						Items: &jsonschema.Schema{
+							Type:                 "object",
+							AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+							Properties: map[string]*jsonschema.Schema{
+								"path":              {Type: "string", Description: "Repository-relative file path"},
+								"operation":         {Type: "string", Enum: []any{"upsert", "delete"}, Description: "Change operation"},
+								"content":           {Type: "string", Description: "Required for upsert; forbidden for delete"},
+								"expected_blob_sha": {Type: "string", Description: "Expected current blob SHA. Required for delete and optional for upsert."},
+							},
+							Required: []string{"path", "operation"},
+						},
+					},
+				},
+				Required: []string{"owner", "repo", "branch", "message", "changes"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			branch, err := RequiredParam[string](args, "branch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			message, err := RequiredParam[string](args, "message")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			expectedHeadSHA, err := OptionalParam[string](args, "expected_head_sha")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if expectedHeadSHA != "" && !looksLikeSHA(expectedHeadSHA) {
+				return utils.NewToolResultError("expected_head_sha must be a full 40-character commit SHA"), nil, nil
+			}
+			changes, err := parseRepositoryChanges(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+			result, apiResult, err := applyRepositoryChanges(ctx, client, owner, repo, branch, message, expectedHeadSHA, changes)
+			if apiResult != nil || err != nil {
+				return apiResult, nil, err
+			}
+			return MarshalledTextResult(result), nil, nil
+		},
+	)
+}
+
 // CreateOrUpdateFile creates a tool to create or update a file in a GitHub repository.
 func CreateOrUpdateFile(t translations.TranslationHelperFunc) inventory.ServerTool {
 	return NewTool(
@@ -963,6 +1216,290 @@ func getCurrentGitHubFile(ctx context.Context, client *github.Client, owner, rep
 		return file, "", resp, err
 	}
 	return file, content, resp, nil
+}
+
+func closeResponse(resp *github.Response) {
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func githubStatusIs(err error, status int) bool {
+	ghErr, ok := err.(*github.ErrorResponse)
+	return ok && ghErr.Response != nil && ghErr.Response.StatusCode == status
+}
+
+func validateBranchName(branch string) error {
+	if strings.TrimSpace(branch) == "" {
+		return fmt.Errorf("branch is required")
+	}
+	if strings.HasPrefix(branch, "refs/") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") || strings.Contains(branch, "..") {
+		return fmt.Errorf("invalid branch name")
+	}
+	return nil
+}
+
+func resolveCommitishToCommitSHA(ctx context.Context, client *github.Client, owner, repo, sourceRef string) (string, *mcp.CallToolResult, error) {
+	sourceRef = strings.TrimSpace(sourceRef)
+	if looksLikeSHA(sourceRef) {
+		commit, resp, err := client.Git.GetCommit(ctx, owner, repo, sourceRef)
+		if err != nil {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source commit", resp, err), nil
+		}
+		closeResponse(resp)
+		return commit.GetSHA(), nil, nil
+	}
+
+	var refName string
+	switch {
+	case strings.HasPrefix(sourceRef, "refs/"):
+		refName = sourceRef
+	case strings.HasPrefix(sourceRef, "heads/") || strings.HasPrefix(sourceRef, "tags/"):
+		refName = "refs/" + sourceRef
+	default:
+		branchRef := "refs/heads/" + sourceRef
+		ref, resp, err := client.Git.GetRef(ctx, owner, repo, branchRef)
+		if err == nil {
+			closeResponse(resp)
+			return peelReferenceToCommitSHA(ctx, client, owner, repo, ref)
+		}
+		closeResponse(resp)
+		if !githubStatusIs(err, http.StatusNotFound) {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source branch", resp, err), nil
+		}
+		refName = "refs/tags/" + sourceRef
+	}
+
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, refName)
+	if err != nil {
+		return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source ref", resp, err), nil
+	}
+	closeResponse(resp)
+	return peelReferenceToCommitSHA(ctx, client, owner, repo, ref)
+}
+
+func peelReferenceToCommitSHA(ctx context.Context, client *github.Client, owner, repo string, ref *github.Reference) (string, *mcp.CallToolResult, error) {
+	if ref == nil || ref.Object == nil {
+		return "", utils.NewToolResultError("source ref did not resolve to an object"), nil
+	}
+	switch ref.GetObject().GetType() {
+	case "", "commit":
+		sha := ref.GetObject().GetSHA()
+		commit, resp, err := client.Git.GetCommit(ctx, owner, repo, sha)
+		if err != nil {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source commit", resp, err), nil
+		}
+		closeResponse(resp)
+		return commit.GetSHA(), nil, nil
+	case "tag":
+		tag, resp, err := client.Git.GetTag(ctx, owner, repo, ref.GetObject().GetSHA())
+		if err != nil {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source tag", resp, err), nil
+		}
+		closeResponse(resp)
+		if tag.GetObject().GetType() != "commit" {
+			return "", utils.NewToolResultError("source tag does not point to a commit"), nil
+		}
+		commit, resp, err := client.Git.GetCommit(ctx, owner, repo, tag.GetObject().GetSHA())
+		if err != nil {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve tagged commit", resp, err), nil
+		}
+		closeResponse(resp)
+		return commit.GetSHA(), nil, nil
+	default:
+		return "", utils.NewToolResultError("source ref does not point to a commit"), nil
+	}
+}
+
+func parseRepositoryChanges(args map[string]any) ([]RepositoryChange, error) {
+	rawChanges, ok := args["changes"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("changes parameter must be an array")
+	}
+	if len(rawChanges) == 0 {
+		return nil, fmt.Errorf("changes must not be empty")
+	}
+	seen := make(map[string]struct{}, len(rawChanges))
+	changes := make([]RepositoryChange, 0, len(rawChanges))
+	for _, rawChange := range rawChanges {
+		changeMap, ok := rawChange.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("each change must be an object")
+		}
+		path, _ := changeMap["path"].(string)
+		operation, _ := changeMap["operation"].(string)
+		content, hasContent := changeMap["content"].(string)
+		expectedBlobSHA, _ := changeMap["expected_blob_sha"].(string)
+		if err := validateRepositoryChangePath(path); err != nil {
+			return nil, err
+		}
+		if _, exists := seen[path]; exists {
+			return nil, fmt.Errorf("duplicate path in changes: %s", path)
+		}
+		seen[path] = struct{}{}
+		switch operation {
+		case "upsert":
+			if !hasContent {
+				return nil, fmt.Errorf("content is required for upsert: %s", path)
+			}
+			if expectedBlobSHA != "" && !looksLikeSHA(expectedBlobSHA) {
+				return nil, fmt.Errorf("expected_blob_sha must be a full SHA for %s", path)
+			}
+			if isSecretLikeRepoPath(path) {
+				return nil, fmt.Errorf("path is blocked by repository safety policy: %s", path)
+			}
+			if reason := detectSecretLikeContent(path, content); reason != "" {
+				return nil, fmt.Errorf("content for %s is blocked by repository safety policy: %s", path, reason)
+			}
+		case "delete":
+			if hasContent {
+				return nil, fmt.Errorf("content is not allowed for delete: %s", path)
+			}
+			if expectedBlobSHA == "" {
+				return nil, fmt.Errorf("expected_blob_sha is required for delete: %s", path)
+			}
+			if !looksLikeSHA(expectedBlobSHA) {
+				return nil, fmt.Errorf("expected_blob_sha must be a full SHA for %s", path)
+			}
+		default:
+			return nil, fmt.Errorf("unknown operation for %s: %s", path, operation)
+		}
+		changes = append(changes, RepositoryChange{
+			Path:            path,
+			Operation:       operation,
+			Content:         content,
+			HasContent:      hasContent,
+			ExpectedBlobSHA: expectedBlobSHA,
+		})
+	}
+	return changes, nil
+}
+
+func validateRepositoryChangePath(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("path is required")
+	}
+	if strings.HasPrefix(path, "/") {
+		return fmt.Errorf("absolute paths are not allowed: %s", path)
+	}
+	cleaned := filepath.Clean(path)
+	if cleaned != path || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasSuffix(path, "/") {
+		return fmt.Errorf("invalid repository file path: %s", path)
+	}
+	return nil
+}
+
+func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, repo, branch, message, expectedHeadSHA string, changes []RepositoryChange) (*ApplyRepositoryChangesResponse, *mcp.CallToolResult, error) {
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get branch reference", resp, err), nil
+	}
+	closeResponse(resp)
+	previousHead := ref.GetObject().GetSHA()
+	if expectedHeadSHA != "" && previousHead != expectedHeadSHA {
+		return nil, utils.NewToolResultError(fmt.Sprintf("expected_head_sha mismatch: current branch head is %s", previousHead)), nil
+	}
+
+	baseCommit, resp, err := client.Git.GetCommit(ctx, owner, repo, previousHead)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get base commit", resp, err), nil
+	}
+	closeResponse(resp)
+	tree, resp, err := client.Git.GetTree(ctx, owner, repo, baseCommit.GetTree().GetSHA(), true)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get base tree", resp, err), nil
+	}
+	closeResponse(resp)
+	if tree.GetTruncated() {
+		return nil, utils.NewToolResultError("base tree is truncated; refusing to validate atomic changes against incomplete tree"), nil
+	}
+
+	entriesByPath := make(map[string]*github.TreeEntry, len(tree.Entries))
+	for _, entry := range tree.Entries {
+		entriesByPath[entry.GetPath()] = entry
+	}
+	treeEntries := make([]*github.TreeEntry, 0, len(changes))
+	added := make([]string, 0)
+	updated := make([]string, 0)
+	deleted := make([]string, 0)
+
+	for _, change := range changes {
+		if entry, ok := entriesByPath[change.Path]; ok && entry.GetType() == "tree" {
+			return nil, utils.NewToolResultError(fmt.Sprintf("path is a directory, not a file: %s", change.Path)), nil
+		}
+		entry, exists := entriesByPath[change.Path]
+		switch change.Operation {
+		case "upsert":
+			if exists {
+				if entry.GetType() != "blob" {
+					return nil, utils.NewToolResultError(fmt.Sprintf("path is not a file: %s", change.Path)), nil
+				}
+				if change.ExpectedBlobSHA != "" && entry.GetSHA() != change.ExpectedBlobSHA {
+					return nil, utils.NewToolResultError(fmt.Sprintf("expected_blob_sha mismatch for %s: current blob SHA is %s", change.Path, entry.GetSHA())), nil
+				}
+				updated = append(updated, change.Path)
+			} else {
+				if change.ExpectedBlobSHA != "" {
+					return nil, utils.NewToolResultError(fmt.Sprintf("expected_blob_sha supplied for missing path: %s", change.Path)), nil
+				}
+				added = append(added, change.Path)
+			}
+			treeEntries = append(treeEntries, &github.TreeEntry{
+				Path:    github.Ptr(change.Path),
+				Mode:    github.Ptr("100644"),
+				Type:    github.Ptr("blob"),
+				Content: github.Ptr(change.Content),
+			})
+		case "delete":
+			if !exists {
+				return nil, utils.NewToolResultError(fmt.Sprintf("cannot delete missing path: %s", change.Path)), nil
+			}
+			if entry.GetType() != "blob" {
+				return nil, utils.NewToolResultError(fmt.Sprintf("path is not a file: %s", change.Path)), nil
+			}
+			if entry.GetSHA() != change.ExpectedBlobSHA {
+				return nil, utils.NewToolResultError(fmt.Sprintf("expected_blob_sha mismatch for %s: current blob SHA is %s", change.Path, entry.GetSHA())), nil
+			}
+			deleted = append(deleted, change.Path)
+			treeEntries = append(treeEntries, &github.TreeEntry{
+				Path: github.Ptr(change.Path),
+				Mode: github.Ptr("100644"),
+				Type: github.Ptr("blob"),
+				SHA:  nil,
+			})
+		}
+	}
+
+	newTree, resp, err := client.Git.CreateTree(ctx, owner, repo, baseCommit.GetTree().GetSHA(), treeEntries)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create tree", resp, err), nil
+	}
+	closeResponse(resp)
+	newCommit, resp, err := client.Git.CreateCommit(ctx, owner, repo, github.Commit{
+		Message: github.Ptr(message),
+		Tree:    newTree,
+		Parents: []*github.Commit{{SHA: github.Ptr(previousHead)}},
+	}, nil)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create commit", resp, err), nil
+	}
+	closeResponse(resp)
+	_, resp, err = client.Git.UpdateRef(ctx, owner, repo, ref.GetRef(), github.UpdateRef{
+		SHA:   newCommit.GetSHA(),
+		Force: github.Ptr(false),
+	})
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to update reference", resp, err), nil
+	}
+	closeResponse(resp)
+	return &ApplyRepositoryChangesResponse{
+		PreviousHeadSHA: previousHead,
+		NewCommitSHA:    newCommit.GetSHA(),
+		NewTreeSHA:      newTree.GetSHA(),
+		AddedPaths:      added,
+		UpdatedPaths:    updated,
+		DeletedPaths:    deleted,
+	}, nil, nil
 }
 
 func createOrUpdateFileOperation(ctx context.Context, deps ToolDependencies, client *github.Client, owner, repo, path, message, branch, expectedSHA string, dryRun bool, patch filePatchInput) (*mcp.CallToolResult, any, error) {

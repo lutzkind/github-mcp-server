@@ -1,0 +1,75 @@
+{
+  "annotations": {
+    "destructiveHint": true,
+    "title": "Apply repository changes"
+  },
+  "description": "Apply multiple file additions, updates, and deletions to a repository branch in one atomic commit.",
+  "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+      "branch": {
+        "description": "Branch to update",
+        "type": "string"
+      },
+      "changes": {
+        "description": "File changes to apply in one commit",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "description": "Required for upsert; forbidden for delete",
+              "type": "string"
+            },
+            "expected_blob_sha": {
+              "description": "Expected current blob SHA. Required for delete and optional for upsert.",
+              "type": "string"
+            },
+            "operation": {
+              "description": "Change operation",
+              "enum": [
+                "upsert",
+                "delete"
+              ],
+              "type": "string"
+            },
+            "path": {
+              "description": "Repository-relative file path",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "operation"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "expected_head_sha": {
+        "description": "Expected current branch head full commit SHA",
+        "type": "string"
+      },
+      "message": {
+        "description": "Commit message",
+        "type": "string"
+      },
+      "owner": {
+        "description": "Repository owner",
+        "type": "string"
+      },
+      "repo": {
+        "description": "Repository name",
+        "type": "string"
+      }
+    },
+    "required": [
+      "owner",
+      "repo",
+      "branch",
+      "message",
+      "changes"
+    ],
+    "type": "object"
+  },
+  "name": "apply_repository_changes"
+}

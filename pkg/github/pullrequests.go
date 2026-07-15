@@ -1082,13 +1082,17 @@ func UpdatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				}
 			}()
 
-			// Return minimal response with just essential information
-			minimalResponse := MinimalResponse{
-				ID:  fmt.Sprintf("%d", finalPR.GetID()),
-				URL: finalPR.GetHTMLURL(),
+			response := struct {
+				ID    string `json:"id"`
+				URL   string `json:"url"`
+				State string `json:"state"`
+			}{
+				ID:    fmt.Sprintf("%d", finalPR.GetID()),
+				URL:   finalPR.GetHTMLURL(),
+				State: finalPR.GetState(),
 			}
 
-			r, err := json.Marshal(minimalResponse)
+			r, err := json.Marshal(response)
 			if err != nil {
 				return utils.NewToolResultErrorFromErr("Failed to marshal response", err), nil, nil
 			}

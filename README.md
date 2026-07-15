@@ -101,6 +101,8 @@ See [Remote Server Documentation](docs/remote-server.md) for full details on rem
 
 When no toolsets are specified, [default toolsets](#default-toolset) are used.
 
+For clean branch creation, atomic multi-file repository changes, obsolete pull request closure, and temporary branch cleanup, see [Repository Hygiene Tools](docs/repository-hygiene.md).
+
 #### Insiders Mode
 
 > **Try new features early!** The remote server offers an insiders version with early access to new features and experimental tools.
@@ -1181,6 +1183,15 @@ The following sets of tools are available:
 
 <summary><picture><source media="(prefers-color-scheme: dark)" srcset="pkg/octicons/icons/repo-dark.png"><source media="(prefers-color-scheme: light)" srcset="pkg/octicons/icons/repo-light.png"><img src="pkg/octicons/icons/repo-light.png" width="20" height="20" alt="repo"></picture> Repositories</summary>
 
+- **apply_repository_changes** - Apply repository changes
+  - **Required OAuth Scopes**: `repo`
+  - `branch`: Branch to update (string, required)
+  - `changes`: File changes to apply in one commit (object[], required)
+  - `expected_head_sha`: Expected current branch head full commit SHA (string, optional)
+  - `message`: Commit message (string, required)
+  - `owner`: Repository owner (string, required)
+  - `repo`: Repository name (string, required)
+
 - **create_branch** - Create branch
   - **Required OAuth Scopes**: `repo`
   - `branch`: Name for new branch (string, required)
@@ -1191,12 +1202,32 @@ The following sets of tools are available:
 - **create_or_update_file** - Create or update file
   - **Required OAuth Scopes**: `repo`
   - `branch`: Branch to create/update the file in (string, required)
-  - `content`: Content of the file (string, required)
+  - `content`: Content of the file (string, optional)
+  - `dry_run`: Validate the request and report what would happen without writing to GitHub (boolean, optional)
+  - `end_line`: One-based inclusive end line for patch_range. (integer, optional)
+  - `expected_blob_sha`: Current Git blob SHA. Required when modifying an existing file. (string, optional)
+  - `expected_occurrences`: Exact number of search matches required. (integer, optional)
+  - `message`: Commit message (string, required)
+  - `operation`: Mutation mode. Omitting this keeps the legacy replace behavior. (string, optional)
+  - `owner`: Repository owner (username or organization) (string, required)
+  - `patch`: Single-file unified diff for unified_diff. (string, optional)
+  - `path`: Path where to create/update the file (string, required)
+  - `replace`: Replacement text for patch_text. (string, optional)
+  - `replacement`: Replacement text for patch_range. (string, optional)
+  - `repo`: Repository name (string, required)
+  - `search`: Exact text to find for patch_text. (string, optional)
+  - `sha`: The blob SHA of the file being replaced. Required if the file already exists. (string, optional)
+  - `start_line`: One-based inclusive start line for patch_range. (integer, optional)
+
+- **create_or_update_file_from_shared_path** - Create or update file from shared path
+  - **Required OAuth Scopes**: `repo`
+  - `branch`: Branch to create/update the file in (string, required)
   - `message`: Commit message (string, required)
   - `owner`: Repository owner (username or organization) (string, required)
-  - `path`: Path where to create/update the file (string, required)
+  - `path`: Repository path where to create/update the file (string, required)
   - `repo`: Repository name (string, required)
   - `sha`: The blob SHA of the file being replaced. Required if the file already exists. (string, optional)
+  - `shared_path`: Relative path under the shared directory mounted into the MCP container (string, required)
 
 - **create_repository** - Create repository
   - **Required OAuth Scopes**: `repo`
@@ -1231,11 +1262,14 @@ The following sets of tools are available:
 
 - **get_file_contents** - Get file or directory contents
   - **Required OAuth Scopes**: `repo`
+  - `end_line`: Optional end line for text file reads (integer, optional)
+  - `max_bytes`: Optional maximum UTF-8 bytes to return for text file reads (integer, optional)
   - `owner`: Repository owner (username or organization) (string, required)
   - `path`: Path to file/directory (string, optional)
   - `ref`: Accepts optional git refs such as `refs/tags/{tag}`, `refs/heads/{branch}` or `refs/pull/{pr_number}/head` (string, optional)
   - `repo`: Repository name (string, required)
   - `sha`: Accepts optional commit SHA. If specified, it will be used instead of ref (string, optional)
+  - `start_line`: Optional start line for text file reads (integer, optional)
 
 - **get_latest_release** - Get latest release
   - **Required OAuth Scopes**: `repo`
@@ -1295,10 +1329,28 @@ The following sets of tools are available:
   - `perPage`: Results per page for pagination (min 1, max 100) (number, optional)
   - `repo`: Repository name (string, required)
 
+- **manage_branch** - Manage branch
+  - **Required OAuth Scopes**: `repo`
+  - `action`: Branch action to perform (string, required)
+  - `branch`: Branch name to create or delete (string, required)
+  - `expected_sha`: Expected full commit SHA for the resolved source on create, or current branch head on delete. (string, optional)
+  - `owner`: Repository owner (string, required)
+  - `repo`: Repository name (string, required)
+  - `source_ref`: Source branch name, tag name, or full commit SHA. Required for create. (string, optional)
+
 - **push_files** - Push files to repository
   - **Required OAuth Scopes**: `repo`
   - `branch`: Branch to push to (string, required)
+  - `dry_run`: Validate the request and report what would happen without writing to GitHub (boolean, optional)
   - `files`: Array of file objects to push, each object with path (string) and content (string) (object[], required)
+  - `message`: Commit message (string, required)
+  - `owner`: Repository owner (string, required)
+  - `repo`: Repository name (string, required)
+
+- **push_files_from_shared_paths** - Push files from shared paths
+  - **Required OAuth Scopes**: `repo`
+  - `branch`: Branch to push to (string, required)
+  - `files`: Array of file objects to push, each object with path (repository path) and shared_path (relative path under the shared directory) (object[], required)
   - `message`: Commit message (string, required)
   - `owner`: Repository owner (string, required)
   - `repo`: Repository name (string, required)
