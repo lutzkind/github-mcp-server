@@ -2,7 +2,9 @@ package github
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -547,12 +549,26 @@ type RepositoryChange struct {
 }
 
 type ApplyRepositoryChangesResponse struct {
-	PreviousHeadSHA string   `json:"previous_head_sha"`
-	NewCommitSHA    string   `json:"new_commit_sha"`
-	NewTreeSHA      string   `json:"new_tree_sha"`
-	AddedPaths      []string `json:"added_paths"`
-	UpdatedPaths    []string `json:"updated_paths"`
-	DeletedPaths    []string `json:"deleted_paths"`
+	RequestID       string         `json:"request_id"`
+	RequestedTarget map[string]any `json:"requested_target"`
+	AppliedTarget   map[string]any `json:"applied_target"`
+	Changed         bool           `json:"changed"`
+	Verified        bool           `json:"verified"`
+	AuditID         string         `json:"audit_id"`
+	PreviousHeadSHA string         `json:"previous_head_sha"`
+	NewCommitSHA    string         `json:"new_commit_sha"`
+	NewTreeSHA      string         `json:"new_tree_sha"`
+	AddedPaths      []string       `json:"added_paths"`
+	UpdatedPaths    []string       `json:"updated_paths"`
+	DeletedPaths    []string       `json:"deleted_paths"`
+}
+
+func mutationRequestID() string {
+	value := make([]byte, 12)
+	if _, err := cryptorand.Read(value); err != nil {
+		return fmt.Sprintf("ghmcp-%d", time.Now().UnixNano())
+	}
+	return "ghmcp-" + hex.EncodeToString(value)
 }
 
 func ApplyRepositoryChanges(t translations.TranslationHelperFunc) inventory.ServerTool {
@@ -628,7 +644,7 @@ func ApplyRepositoryChanges(t translations.TranslationHelperFunc) inventory.Serv
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
-			result, apiResult, err := applyRepositoryChanges(ctx, client, owner, repo, branch, message, expectedHeadSHA, changes)
+			result, apiResult, err := applyRepositoryChanges(ctx, client, owner, repo, branch, message, expectedHeadSHA, changes, mutationRequestID())
 			if apiResult != nil || err != nil {
 				return apiResult, nil, err
 			}
@@ -1389,7 +1405,7 @@ func validateRepositoryChangePath(path string) error {
 	return nil
 }
 
-func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, repo, branch, message, expectedHeadSHA string, changes []RepositoryChange) (*ApplyRepositoryChangesResponse, *mcp.CallToolResult, error) {
+func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, repo, branch, message, expectedHeadSHA string, changes []RepositoryChange, requestID string) (*ApplyRepositoryChangesResponse, *mcp.CallToolResult, error) {
 	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
 	if err != nil {
 		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get branch reference", resp, err), nil
@@ -1492,7 +1508,69 @@ func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, r
 		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to update reference", resp, err), nil
 	}
 	closeResponse(resp)
+	verifiedRef, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	if err != nil || verifiedRef == nil || verifiedRef.GetObject().GetSHA() != newCommit.GetSHA() {
+		closeResponse(resp)
+		return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: branch head does not belong to the requested repository/branch"), nil
+	}
+	closeResponse(resp)
+	verifiedCommit, resp, err := client.Git.GetCommit(ctx, owner, repo, newCommit.GetSHA())
+	if err != nil || verifiedCommit == nil || verifiedCommit.GetSHA() != newCommit.GetSHA() || len(verifiedCommit.Parents) == 0 || verifiedCommit.Parents[0].GetSHA() != previousHead {
+		closeResponse(resp)
+		return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: returned commit or parent does not match the requested repository/branch"), nil
+	}
+	closeResponse(resp)
+	verifiedTree, resp, err := client.Git.GetTree(ctx, owner, repo, verifiedCommit.GetTree().GetSHA(), true)
+	if err != nil || verifiedTree == nil || verifiedTree.GetTruncated() {
+		closeResponse(resp)
+		return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: returned commit tree could not be verified"), nil
+	}
+	closeResponse(resp)
+	beforeByPath := entriesByPath
+	afterByPath := make(map[string]*github.TreeEntry, len(verifiedTree.Entries))
+	for _, entry := range verifiedTree.Entries {
+		afterByPath[entry.GetPath()] = entry
+	}
+	requestedPaths := make(map[string]struct{}, len(changes))
+	for _, change := range changes {
+		requestedPaths[change.Path] = struct{}{}
+	}
+	requestedPathList := make([]string, 0, len(requestedPaths))
+	for path := range requestedPaths {
+		requestedPathList = append(requestedPathList, path)
+	}
+	for path := range beforeByPath {
+		if _, requested := requestedPaths[path]; requested {
+			continue
+		}
+		if beforeByPath[path].GetSHA() != afterByPath[path].GetSHA() {
+			return nil, utils.NewToolResultError("TARGET_MISMATCH: an unrequested repository path changed"), nil
+		}
+	}
+	for path := range afterByPath {
+		if _, requested := requestedPaths[path]; requested {
+			continue
+		}
+		if beforeByPath[path] == nil {
+			return nil, utils.NewToolResultError("TARGET_MISMATCH: an unrequested repository path was added"), nil
+		}
+	}
+	for _, change := range changes {
+		entry, exists := afterByPath[change.Path]
+		if change.Operation == "delete" && exists {
+			return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: requested path was not deleted"), nil
+		}
+		if change.Operation == "upsert" && (!exists || entry.GetType() != "blob") {
+			return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: requested path was not written as a blob"), nil
+		}
+	}
 	return &ApplyRepositoryChangesResponse{
+		RequestID:       requestID,
+		RequestedTarget: map[string]any{"owner": owner, "repo": repo, "branch": branch, "paths": requestedPathList},
+		AppliedTarget:   map[string]any{"owner": owner, "repo": repo, "branch": branch, "commit_sha": newCommit.GetSHA()},
+		Changed:         true,
+		Verified:        true,
+		AuditID:         requestID,
 		PreviousHeadSHA: previousHead,
 		NewCommitSHA:    newCommit.GetSHA(),
 		NewTreeSHA:      newTree.GetSHA(),
@@ -1585,10 +1663,31 @@ func createOrUpdateFileOperation(ctx context.Context, deps ToolDependencies, cli
 	if committedContent != after {
 		return utils.NewToolResultError("post-commit verification failed: committed content does not match the requested change"), nil, nil
 	}
+	commitSHA := committed.Commit.GetSHA()
+	if commitSHA == "" {
+		return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: GitHub did not return a commit SHA for the requested file"), nil, nil
+	}
+	verifiedRef, verifyRefResp, verifyRefErr := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	closeResponse(verifyRefResp)
+	if verifyRefErr != nil || verifiedRef == nil || verifiedRef.GetObject().GetSHA() != commitSHA {
+		return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: file commit does not belong to the requested repository branch"), nil, nil
+	}
 	if exists && verified.GetSHA() == expectedSHA {
 		return utils.NewToolResultError("post-commit verification failed: blob SHA did not change"), nil, nil
 	}
-	return MarshalledTextResult(map[string]any{"ok": true, "applied": true, "verification": map[string]any{"ok": true, "exact_content": true, "unrelated_content_preserved": true}, "content": convertToMinimalFileContentResponse(committed)}), nil, nil
+	requestID := mutationRequestID()
+	return MarshalledTextResult(map[string]any{
+		"ok":               true,
+		"applied":          true,
+		"requested_target": map[string]any{"owner": owner, "repo": repo, "branch": branch, "path": path, "expected_blob_sha": expectedSHA},
+		"applied_target":   map[string]any{"owner": owner, "repo": repo, "branch": branch, "path": path, "commit_sha": commitSHA, "blob_sha": verified.GetSHA()},
+		"changed":          true,
+		"verified":         true,
+		"request_id":       requestID,
+		"audit_id":         requestID,
+		"verification":     map[string]any{"ok": true, "exact_content": true, "unrelated_content_preserved": true},
+		"content":          convertToMinimalFileContentResponse(committed),
+	}), nil, nil
 }
 
 func CreateOrUpdateFileFromSharedPath(t translations.TranslationHelperFunc) inventory.ServerTool {

@@ -785,11 +785,21 @@ func CreatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				}
 				return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to create pull request", resp, bodyBytes), nil, nil
 			}
+			verifiedPR, verifyResp, verifyErr := client.PullRequests.Get(ctx, owner, repo, pr.GetNumber())
+			closeResponse(verifyResp)
+			if verifyErr != nil || verifiedPR == nil || verifiedPR.GetNumber() != pr.GetNumber() || verifiedPR.GetBase().GetRepo().GetFullName() != owner+"/"+repo {
+				return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: created pull request target does not match the requested repository"), nil, nil
+			}
 
 			// Return minimal response with just essential information
-			minimalResponse := MinimalResponse{
-				ID:  fmt.Sprintf("%d", pr.GetID()),
-				URL: pr.GetHTMLURL(),
+			minimalResponse := map[string]any{
+				"id":               fmt.Sprintf("%d", pr.GetID()),
+				"url":              pr.GetHTMLURL(),
+				"requested_target": map[string]any{"owner": owner, "repo": repo, "base": base, "head": head},
+				"applied_target":   map[string]any{"owner": owner, "repo": repo, "pull_request_number": pr.GetNumber()},
+				"changed":          true,
+				"verified":         true,
+				"audit_id":         mutationRequestID(),
 			}
 
 			r, err := json.Marshal(minimalResponse)
@@ -1083,13 +1093,26 @@ func UpdatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 			}()
 
 			response := struct {
-				ID    string `json:"id"`
-				URL   string `json:"url"`
-				State string `json:"state"`
+				ID              string         `json:"id"`
+				URL             string         `json:"url"`
+				State           string         `json:"state"`
+				RequestedTarget map[string]any `json:"requested_target"`
+				AppliedTarget   map[string]any `json:"applied_target"`
+				Changed         bool           `json:"changed"`
+				Verified        bool           `json:"verified"`
+				AuditID         string         `json:"audit_id"`
 			}{
-				ID:    fmt.Sprintf("%d", finalPR.GetID()),
-				URL:   finalPR.GetHTMLURL(),
-				State: finalPR.GetState(),
+				ID:              fmt.Sprintf("%d", finalPR.GetID()),
+				URL:             finalPR.GetHTMLURL(),
+				State:           finalPR.GetState(),
+				RequestedTarget: map[string]any{"owner": owner, "repo": repo, "pull_request_number": pullNumber},
+				AppliedTarget:   map[string]any{"owner": owner, "repo": repo, "pull_request_number": finalPR.GetNumber()},
+				Changed:         true,
+				Verified:        finalPR.GetNumber() == pullNumber && finalPR.GetBase().GetRepo().GetFullName() == owner+"/"+repo,
+				AuditID:         mutationRequestID(),
+			}
+			if !response.Verified {
+				return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: updated pull request target does not match request"), nil, nil
 			}
 
 			r, err := json.Marshal(response)
@@ -1447,8 +1470,14 @@ func MergePullRequest(t translations.TranslationHelperFunc) inventory.ServerTool
 				}
 				return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to merge pull request", resp, bodyBytes), nil, nil
 			}
+			verifiedPR, verifyResp, verifyErr := client.PullRequests.Get(ctx, owner, repo, pullNumber)
+			closeResponse(verifyResp)
+			if verifyErr != nil || verifiedPR == nil || verifiedPR.GetNumber() != pullNumber || verifiedPR.GetBase().GetRepo().GetFullName() != owner+"/"+repo || !result.GetMerged() {
+				return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: merge result does not match the requested pull request"), nil, nil
+			}
 
-			r, err := json.Marshal(result)
+			response := map[string]any{"requested_target": map[string]any{"owner": owner, "repo": repo, "pull_request_number": pullNumber}, "applied_target": map[string]any{"owner": owner, "repo": repo, "pull_request_number": pullNumber, "merge_commit_sha": result.GetSHA()}, "changed": true, "verified": true, "audit_id": mutationRequestID(), "merge": result}
+			r, err := json.Marshal(response)
 			if err != nil {
 				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
 			}
