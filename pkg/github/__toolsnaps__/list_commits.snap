@@ -11,20 +11,6 @@
         "description": "Author username or email address to filter commits by",
         "type": "string"
       },
-      "fields": {
-        "description": "Subset of fields to return for each commit.",
-        "items": {
-          "enum": [
-            "sha",
-            "html_url",
-            "commit",
-            "author",
-            "committer"
-          ],
-          "type": "string"
-        },
-        "type": "array"
-      },
       "owner": {
         "description": "Repository owner",
         "type": "string"

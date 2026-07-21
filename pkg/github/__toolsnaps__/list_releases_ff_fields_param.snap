@@ -8,7 +8,7 @@
   "inputSchema": {
     "properties": {
       "fields": {
-        "description": "Subset of fields to return for each release. If omitted, all fields are returned. Use this to reduce response size when you only need specific fields; omitting 'body' in particular drops the largest per-release data.",
+        "description": "Subset of fields to return for each release.",
         "items": {
           "enum": [
             "id",

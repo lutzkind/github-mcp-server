@@ -11,24 +11,6 @@
         "description": "Optional end line for text file reads",
         "type": "integer"
       },
-      "fields": {
-        "description": "Subset of fields to return for directory entries.",
-        "items": {
-          "enum": [
-            "type",
-            "name",
-            "path",
-            "size",
-            "sha",
-            "url",
-            "git_url",
-            "html_url",
-            "download_url"
-          ],
-          "type": "string"
-        },
-        "type": "array"
-      },
       "max_bytes": {
         "description": "Optional maximum UTF-8 bytes to return for text file reads",
         "type": "integer"
