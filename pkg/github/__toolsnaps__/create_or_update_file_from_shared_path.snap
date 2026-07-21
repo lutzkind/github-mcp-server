@@ -1,5 +1,7 @@
 {
   "annotations": {
+    "idempotentHint": false,
+    "readOnlyHint": false,
     "title": "Create or update file from shared path"
   },
   "description": "Create or update a single file in a GitHub repository using a UTF-8 text file that already exists on the MCP host under the shared directory.\n\nUse this when the file content is already available on the server and is too large or too awkward to send inline through the MCP tool call.\n\nOnly files inside the configured shared directory are allowed. SHA MUST be provided for existing file updates.",

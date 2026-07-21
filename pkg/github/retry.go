@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	gogithub "github.com/google/go-github/v87/github"
+	gogithub "github.com/google/go-github/v89/github"
 )
 
 func retryGitHubCall[T any](

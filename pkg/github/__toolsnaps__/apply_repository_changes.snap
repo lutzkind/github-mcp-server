@@ -1,6 +1,8 @@
 {
   "annotations": {
     "destructiveHint": true,
+    "idempotentHint": false,
+    "readOnlyHint": false,
     "title": "Apply repository changes"
   },
   "description": "Apply multiple file additions, updates, and deletions to a repository branch in one atomic commit.",

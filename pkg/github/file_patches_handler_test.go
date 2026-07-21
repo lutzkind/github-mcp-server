@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/google/go-github/v87/github"
+	"github.com/google/go-github/v89/github"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,7 +43,7 @@ func TestCreateOrUpdateFileOneLinePatchLargeFileDryRunAndVerification(t *testing
 		},
 		PutReposContentsByOwnerByRepoByPath: mockResponse(t, http.StatusOK, commit),
 		GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.Reference{
-			Ref: github.Ptr("refs/heads/main"),
+			Ref:    github.Ptr("refs/heads/main"),
 			Object: &github.GitObject{SHA: github.Ptr("commit-new")},
 		}),
 	})

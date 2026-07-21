@@ -1,5 +1,7 @@
 {
   "annotations": {
+    "idempotentHint": false,
+    "readOnlyHint": false,
     "title": "Push files from shared paths"
   },
   "description": "Push multiple UTF-8 text files from the shared directory to a GitHub repository in a single commit.",

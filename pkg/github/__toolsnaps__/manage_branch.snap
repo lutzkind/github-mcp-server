@@ -1,6 +1,8 @@
 {
   "annotations": {
     "destructiveHint": true,
+    "idempotentHint": false,
+    "readOnlyHint": false,
     "title": "Manage branch"
   },
   "description": "Create or delete a GitHub repository branch with explicit source and head SHA safety checks.",

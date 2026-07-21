@@ -2817,7 +2817,7 @@ func Test_UpdatePullRequest_MCPAppsFeature_UIGate(t *testing.T) {
 		Title:   github.Ptr("Updated"),
 		HTMLURL: github.Ptr("https://github.com/owner/repo/pull/42"),
 		Head:    &github.PullRequestBranch{SHA: github.Ptr("abc"), Ref: github.Ptr("feature")},
-		Base:    &github.PullRequestBranch{SHA: github.Ptr("def"), Ref: github.Ptr("main")},
+		Base:    &github.PullRequestBranch{SHA: github.Ptr("def"), Ref: github.Ptr("main"), Repo: &github.Repository{FullName: github.Ptr("owner/repo")}},
 		User:    &github.User{Login: github.Ptr("testuser")},
 	}
 

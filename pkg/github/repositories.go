@@ -26,7 +26,7 @@ import (
 	"github.com/github/github-mcp-server/pkg/scopes"
 	"github.com/github/github-mcp-server/pkg/translations"
 	"github.com/github/github-mcp-server/pkg/utils"
-	"github.com/google/go-github/v87/github"
+	"github.com/google/go-github/v89/github"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shurcooL/githubv4"
@@ -142,7 +142,7 @@ func GetCommit(t translations.TranslationHelperFunc) inventory.ServerTool {
 
 // ListCommits creates a tool to get commits of a branch in a repository.
 func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return NewTool(
+	st := NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "list_commits",
@@ -182,6 +182,10 @@ func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
 						Type:        "string",
 						Description: "Only commits before this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
 					},
+					"fields": fieldsSchemaProperty(
+						"Subset of fields to return for each commit.",
+						listCommitsItemFieldEnum,
+					),
 				},
 				Required: []string{"owner", "repo"},
 			}),
@@ -217,6 +221,10 @@ func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			pagination, err := OptionalPaginationParams(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			fields, err := OptionalStringArrayParam(args, "fields")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -279,11 +287,21 @@ func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
 				minimalCommits[i] = convertToMinimalCommit(commit, commitDetailNone)
 			}
 
-			r, err := json.Marshal(minimalCommits)
+			filtered := false
+			var payload any = minimalCommits
+			if len(fields) > 0 {
+				payload, err = filterEachField(minimalCommits, fields)
+				if err != nil {
+					return utils.NewToolResultErrorFromErr("failed to filter commits", err), nil, nil
+				}
+				filtered = true
+			}
+			r, err := json.Marshal(payload)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
+			recordFieldsUsageFor(ctx, deps, "list_commits", minimalCommits, filtered, len(r))
 			result := utils.NewToolResultText(string(r))
 			// Commit content is reachable from the repo's history; integrity
 			// follows the same public-untrusted / private-trusted rule as file
@@ -292,6 +310,19 @@ func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
 			return result, nil, nil
 		},
 	)
+	st.FeatureFlagEnable = FeatureFlagFieldsParam
+	return st
+}
+
+// LegacyListCommits is the feature-flag-disabled schema variant.
+func LegacyListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := ListCommits(t)
+	st.FeatureFlagEnable = ""
+	if schema, ok := st.Tool.InputSchema.(*jsonschema.Schema); ok {
+		delete(schema.Properties, "fields")
+	}
+	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
+	return st
 }
 
 // ListBranches creates a tool to list branches in a GitHub repository.
@@ -2286,7 +2317,7 @@ func newBinaryMetadataToolResult(owner, repo, filePath, ref, sha, mimeType strin
 
 // GetFileContents creates a tool to get the contents of a file or directory from a GitHub repository.
 func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return NewTool(
+	st := NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "get_file_contents",
@@ -2331,6 +2362,10 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 						Type:        "integer",
 						Description: "Optional maximum UTF-8 bytes to return for text file reads",
 					},
+					"fields": fieldsSchemaProperty(
+						"Subset of fields to return for directory entries.",
+						fileContentFieldEnum,
+					),
 				},
 				Required: []string{"owner", "repo"},
 			},
@@ -2527,6 +2562,19 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 			return utils.NewToolResultError("failed to get file contents"), nil, nil
 		},
 	)
+	st.FeatureFlagEnable = FeatureFlagFieldsParam
+	return st
+}
+
+// LegacyGetFileContents is the feature-flag-disabled compatibility variant.
+func LegacyGetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := GetFileContents(t)
+	st.FeatureFlagEnable = ""
+	if schema, ok := st.Tool.InputSchema.(*jsonschema.Schema); ok {
+		delete(schema.Properties, "fields")
+	}
+	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
+	return st
 }
 
 // ForkRepository creates a tool to fork a repository.
@@ -3461,7 +3509,7 @@ func GetTag(t translations.TranslationHelperFunc) inventory.ServerTool {
 
 // ListReleases creates a tool to list releases in a GitHub repository.
 func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return NewTool(
+	st := NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "list_releases",
@@ -3481,6 +3529,10 @@ func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
 						Type:        "string",
 						Description: "Repository name",
 					},
+					"fields": fieldsSchemaProperty(
+						"Subset of fields to return for each release.",
+						listReleasesItemFieldEnum,
+					),
 				},
 				Required: []string{"owner", "repo"},
 			}),
@@ -3496,6 +3548,10 @@ func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			pagination, err := OptionalPaginationParams(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			fields, err := OptionalStringArrayParam(args, "fields")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -3531,11 +3587,21 @@ func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
 				}
 			}
 
-			r, err := json.Marshal(minimalReleases)
+			filtered := false
+			var payload any = minimalReleases
+			if len(fields) > 0 {
+				payload, err = filterEachField(minimalReleases, fields)
+				if err != nil {
+					return utils.NewToolResultErrorFromErr("failed to filter releases", err), nil, nil
+				}
+				filtered = true
+			}
+			r, err := json.Marshal(payload)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
+			recordFieldsUsageFor(ctx, deps, "list_releases", minimalReleases, filtered, len(r))
 			result := utils.NewToolResultText(string(r))
 			// Releases are published by collaborators with push access, so
 			// integrity is trusted. Confidentiality follows repo visibility,
@@ -3556,6 +3622,19 @@ func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
 			return result, nil, nil
 		},
 	)
+	st.FeatureFlagEnable = FeatureFlagFieldsParam
+	return st
+}
+
+// LegacyListReleases is the feature-flag-disabled schema variant.
+func LegacyListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := ListReleases(t)
+	st.FeatureFlagEnable = ""
+	if schema, ok := st.Tool.InputSchema.(*jsonschema.Schema); ok {
+		delete(schema.Properties, "fields")
+	}
+	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
+	return st
 }
 
 // GetLatestRelease creates a tool to get the latest release in a GitHub repository.

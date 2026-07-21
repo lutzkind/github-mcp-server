@@ -17,7 +17,7 @@ import (
 	"github.com/github/github-mcp-server/pkg/raw"
 	"github.com/github/github-mcp-server/pkg/translations"
 	"github.com/github/github-mcp-server/pkg/utils"
-	"github.com/google/go-github/v87/github"
+	"github.com/google/go-github/v89/github"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shurcooL/githubv4"
@@ -4067,20 +4067,26 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 		}
 		mapsToSortedEntries := func(entries map[string]map[string]any) []map[string]any {
 			result := make([]map[string]any, 0, len(entries))
-			for _, entry := range entries { result = append(result, entry) }
+			for _, entry := range entries {
+				result = append(result, entry)
+			}
 			return result
 		}
 		return map[string]http.HandlerFunc{
 			GetReposGitRefByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
 				refReads++
 				sha := headSHA
-				if refReads > 1 { sha = newCommitSHA }
+				if refReads > 1 {
+					sha = newCommitSHA
+				}
 				mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sha+`"}}`)(w, nil)
 			},
 			GetReposGitCommitsByOwnerByRepoByCommitSHA: func(w http.ResponseWriter, _ *http.Request) {
 				commitReads++
 				sha, tree := headSHA, baseTreeSHA
-				if commitReads > 1 { sha, tree = newCommitSHA, newTreeSHA }
+				if commitReads > 1 {
+					sha, tree = newCommitSHA, newTreeSHA
+				}
 				mockResponse(t, http.StatusOK, `{"sha":"`+sha+`","tree":{"sha":"`+tree+`"},"parents":[{"sha":"`+headSHA+`"}]}`)(w, nil)
 			},
 			GetReposGitTreesByOwnerByRepoByTree: func(w http.ResponseWriter, _ *http.Request) {
@@ -4254,13 +4260,13 @@ func Test_ListReleases(t *testing.T) {
 
 	mockReleases := []*github.RepositoryRelease{
 		{
-			ID:      github.Ptr(int64(1)),
-			TagName: github.Ptr("v1.0.0"),
+			ID:      1,
+			TagName: "v1.0.0",
 			Name:    github.Ptr("First Release"),
 		},
 		{
-			ID:      github.Ptr(int64(2)),
-			TagName: github.Ptr("v0.9.0"),
+			ID:      2,
+			TagName: "v0.9.0",
 			Name:    github.Ptr("Beta Release"),
 		},
 	}
@@ -4331,7 +4337,7 @@ func Test_ListReleases(t *testing.T) {
 			require.NoError(t, err)
 			assert.Len(t, returnedReleases, len(tc.expectedResult))
 			for i := range returnedReleases {
-				assert.Equal(t, *tc.expectedResult[i].TagName, returnedReleases[i].TagName)
+				assert.Equal(t, tc.expectedResult[i].TagName, returnedReleases[i].TagName)
 			}
 		})
 	}
@@ -4352,8 +4358,8 @@ func Test_GetLatestRelease(t *testing.T) {
 	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo"})
 
 	mockRelease := &github.RepositoryRelease{
-		ID:      github.Ptr(int64(1)),
-		TagName: github.Ptr("v1.0.0"),
+		ID:      1,
+		TagName: "v1.0.0",
 		Name:    github.Ptr("First Release"),
 	}
 
@@ -4421,7 +4427,7 @@ func Test_GetLatestRelease(t *testing.T) {
 			var returnedRelease github.RepositoryRelease
 			err = json.Unmarshal([]byte(textContent.Text), &returnedRelease)
 			require.NoError(t, err)
-			assert.Equal(t, *tc.expectedResult.TagName, *returnedRelease.TagName)
+			assert.Equal(t, tc.expectedResult.TagName, returnedRelease.TagName)
 		})
 	}
 }
@@ -4442,13 +4448,13 @@ func Test_GetReleaseByTag(t *testing.T) {
 	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "tag"})
 
 	mockRelease := &github.RepositoryRelease{
-		ID:      github.Ptr(int64(1)),
-		TagName: github.Ptr("v1.0.0"),
+		ID:      1,
+		TagName: "v1.0.0",
 		Name:    github.Ptr("Release v1.0.0"),
 		Body:    github.Ptr("This is the first stable release."),
 		Assets: []*github.ReleaseAsset{
 			{
-				ID:   github.Ptr(int64(1)),
+					ID:   github.Ptr(int64(1)),
 				Name: github.Ptr("release-v1.0.0.tar.gz"),
 			},
 		},
@@ -4583,8 +4589,8 @@ func Test_GetReleaseByTag(t *testing.T) {
 			err = json.Unmarshal([]byte(textContent.Text), &returnedRelease)
 			require.NoError(t, err)
 
-			assert.Equal(t, *tc.expectedResult.ID, *returnedRelease.ID)
-			assert.Equal(t, *tc.expectedResult.TagName, *returnedRelease.TagName)
+			assert.Equal(t, tc.expectedResult.ID, returnedRelease.ID)
+			assert.Equal(t, tc.expectedResult.TagName, returnedRelease.TagName)
 			assert.Equal(t, *tc.expectedResult.Name, *returnedRelease.Name)
 			if tc.expectedResult.Body != nil {
 				assert.Equal(t, *tc.expectedResult.Body, *returnedRelease.Body)
@@ -4610,10 +4616,10 @@ func Test_GetReleaseByTag_IFC_FeatureFlag(t *testing.T) {
 
 	makeRelease := func(draft bool) *github.RepositoryRelease {
 		return &github.RepositoryRelease{
-			ID:      github.Ptr(int64(1)),
-			TagName: github.Ptr("v1.0.0"),
+			ID:      1,
+			TagName: "v1.0.0",
 			Name:    github.Ptr("v1.0.0"),
-			Draft:   github.Ptr(draft),
+			Draft:   draft,
 		}
 	}
 
