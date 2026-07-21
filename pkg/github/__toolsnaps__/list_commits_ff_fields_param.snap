@@ -12,7 +12,7 @@
         "type": "string"
       },
       "fields": {
-        "description": "Subset of fields to return for each commit. If omitted, all fields are returned. Use this to reduce response size when you only need specific fields, e.g. just 'sha' and 'html_url'.",
+        "description": "Subset of fields to return for each commit.",
         "items": {
           "enum": [
             "sha",

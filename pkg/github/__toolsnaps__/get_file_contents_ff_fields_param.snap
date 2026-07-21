@@ -7,8 +7,12 @@
   "description": "Get the contents of a file or directory from a GitHub repository",
   "inputSchema": {
     "properties": {
+      "end_line": {
+        "description": "Optional end line for text file reads",
+        "type": "integer"
+      },
       "fields": {
-        "description": "Subset of fields to return for each entry when the path is a directory. If omitted, all fields are returned. Ignored when the path is a single file. Use this to reduce response size when listing directories and you only need specific fields, e.g. just 'name' and 'type'.",
+        "description": "Subset of fields to return for directory entries.",
         "items": {
           "enum": [
             "type",
@@ -24,6 +28,10 @@
           "type": "string"
         },
         "type": "array"
+      },
+      "max_bytes": {
+        "description": "Optional maximum UTF-8 bytes to return for text file reads",
+        "type": "integer"
       },
       "owner": {
         "description": "Repository owner (username or organization)",
@@ -45,6 +53,10 @@
       "sha": {
         "description": "Accepts optional commit SHA. If specified, it will be used instead of ref",
         "type": "string"
+      },
+      "start_line": {
+        "description": "Optional start line for text file reads",
+        "type": "integer"
       }
     },
     "required": [
