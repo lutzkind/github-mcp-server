@@ -1,0 +1,50 @@
+{
+  "annotations": {
+    "idempotentHint": false,
+    "readOnlyHint": false,
+    "title": "Create or update file from shared path"
+  },
+  "description": "Create or update a single file in a GitHub repository using a UTF-8 text file that already exists on the MCP host under the shared directory.\n\nUse this when the file content is already available on the server and is too large or too awkward to send inline through the MCP tool call.\n\nOnly files inside the configured shared directory are allowed. SHA MUST be provided for existing file updates.",
+  "inputSchema": {
+    "properties": {
+      "branch": {
+        "description": "Branch to create/update the file in",
+        "type": "string"
+      },
+      "message": {
+        "description": "Commit message",
+        "type": "string"
+      },
+      "owner": {
+        "description": "Repository owner (username or organization)",
+        "type": "string"
+      },
+      "path": {
+        "description": "Repository path where to create/update the file",
+        "type": "string"
+      },
+      "repo": {
+        "description": "Repository name",
+        "type": "string"
+      },
+      "sha": {
+        "description": "The blob SHA of the file being replaced. Required if the file already exists.",
+        "type": "string"
+      },
+      "shared_path": {
+        "description": "Relative path under the shared directory mounted into the MCP container",
+        "type": "string"
+      }
+    },
+    "required": [
+      "owner",
+      "repo",
+      "path",
+      "shared_path",
+      "message",
+      "branch"
+    ],
+    "type": "object"
+  },
+  "name": "create_or_update_file_from_shared_path"
+}

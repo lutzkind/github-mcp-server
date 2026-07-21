@@ -1,0 +1,50 @@
+{
+  "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "readOnlyHint": false,
+    "title": "Manage branch"
+  },
+  "description": "Create or delete a GitHub repository branch with explicit source and head SHA safety checks.",
+  "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+      "action": {
+        "description": "Branch action to perform",
+        "enum": [
+          "create",
+          "delete"
+        ],
+        "type": "string"
+      },
+      "branch": {
+        "description": "Branch name to create or delete",
+        "type": "string"
+      },
+      "expected_sha": {
+        "description": "Expected full commit SHA for the resolved source on create, or current branch head on delete.",
+        "type": "string"
+      },
+      "owner": {
+        "description": "Repository owner",
+        "type": "string"
+      },
+      "repo": {
+        "description": "Repository name",
+        "type": "string"
+      },
+      "source_ref": {
+        "description": "Source branch name, tag name, or full commit SHA. Required for create.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "owner",
+      "repo",
+      "action",
+      "branch"
+    ],
+    "type": "object"
+  },
+  "name": "manage_branch"
+}

@@ -4,12 +4,16 @@
     "readOnlyHint": false,
     "title": "Push files to repository"
   },
-  "description": "Push multiple files to a GitHub repository in a single commit",
+  "description": "Push multiple files to a GitHub repository in a single atomic commit. Each file supports replace, patch_text, patch_range, and unified_diff with expected_blob_sha and expected_occurrences; dry_run previews the complete multi-file patch and any failed expectation prevents a commit.",
   "inputSchema": {
     "properties": {
       "branch": {
         "description": "Branch to push to",
         "type": "string"
+      },
+      "dry_run": {
+        "description": "Validate the request and report what would happen without writing to GitHub",
+        "type": "boolean"
       },
       "files": {
         "description": "Array of file objects to push, each object with path (string) and content (string)",
@@ -20,14 +24,46 @@
               "description": "file content",
               "type": "string"
             },
+            "end_line": {
+              "type": "integer"
+            },
+            "expected_blob_sha": {
+              "type": "string"
+            },
+            "expected_occurrences": {
+              "type": "integer"
+            },
+            "operation": {
+              "enum": [
+                "replace",
+                "patch_text",
+                "patch_range",
+                "unified_diff"
+              ],
+              "type": "string"
+            },
+            "patch": {
+              "type": "string"
+            },
             "path": {
               "description": "path to the file",
               "type": "string"
+            },
+            "replace": {
+              "type": "string"
+            },
+            "replacement": {
+              "type": "string"
+            },
+            "search": {
+              "type": "string"
+            },
+            "start_line": {
+              "type": "integer"
             }
           },
           "required": [
-            "path",
-            "content"
+            "path"
           ],
           "type": "object"
         },

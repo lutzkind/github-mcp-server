@@ -1,0 +1,59 @@
+{
+  "annotations": {
+    "idempotentHint": false,
+    "readOnlyHint": false,
+    "title": "Push files from shared paths"
+  },
+  "description": "Push multiple UTF-8 text files from the shared directory to a GitHub repository in a single commit.",
+  "inputSchema": {
+    "properties": {
+      "branch": {
+        "description": "Branch to push to",
+        "type": "string"
+      },
+      "files": {
+        "description": "Array of file objects to push, each object with path (repository path) and shared_path (relative path under the shared directory)",
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "description": "Repository path for the file",
+              "type": "string"
+            },
+            "shared_path": {
+              "description": "Relative path under the shared directory mounted into the MCP container",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "shared_path"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "message": {
+        "description": "Commit message",
+        "type": "string"
+      },
+      "owner": {
+        "description": "Repository owner",
+        "type": "string"
+      },
+      "repo": {
+        "description": "Repository name",
+        "type": "string"
+      }
+    },
+    "required": [
+      "owner",
+      "repo",
+      "branch",
+      "files",
+      "message"
+    ],
+    "type": "object"
+  },
+  "name": "push_files_from_shared_paths"
+}

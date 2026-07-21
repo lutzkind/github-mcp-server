@@ -2,14 +2,22 @@ package github
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	ghErrors "github.com/github/github-mcp-server/pkg/errors"
 	"github.com/github/github-mcp-server/pkg/ifc"
@@ -132,77 +140,9 @@ func GetCommit(t translations.TranslationHelperFunc) inventory.ServerTool {
 	)
 }
 
-// ListCommits creates a tool to get the list of commits of a branch in a GitHub
-// repository. It is the FeatureFlagFieldsParam-enabled variant: it advertises
-// the optional `fields` parameter and filters each commit to the requested
-// subset. Both this and LegacyListCommits register under the tool name
-// "list_commits"; exactly one is active for any given request thanks to mutually
-// exclusive FeatureFlagEnable / FeatureFlagDisable annotations.
+// ListCommits creates a tool to get commits of a branch in a repository.
 func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
-	st := listCommitsTool(t, true)
-	st.FeatureFlagEnable = FeatureFlagFieldsParam
-	return st
-}
-
-// LegacyListCommits is the FeatureFlagFieldsParam-disabled variant of
-// list_commits. It exposes the original schema (no `fields` parameter) and never
-// filters results, so it acts as the kill switch when the flag is off. It owns
-// the canonical list_commits.snap; the flag-enabled variant owns
-// list_commits_ff_<flag>.snap. Delete this function when the flag is removed.
-func LegacyListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
-	st := listCommitsTool(t, false)
-	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
-	return st
-}
-
-// listCommitsTool builds the list_commits tool. When includeFields is true the
-// tool advertises the optional `fields` parameter, filters each commit to the
-// requested subset, and emits fields telemetry. When false it is the original
-// tool with no fields parameter and no filtering.
-func listCommitsTool(t translations.TranslationHelperFunc, includeFields bool) inventory.ServerTool {
-	schema := &jsonschema.Schema{
-		Type: "object",
-		Properties: map[string]*jsonschema.Schema{
-			"owner": {
-				Type:        "string",
-				Description: "Repository owner",
-			},
-			"repo": {
-				Type:        "string",
-				Description: "Repository name",
-			},
-			"sha": {
-				Type:        "string",
-				Description: "Commit SHA, branch or tag name to list commits of. If not provided, uses the default branch of the repository. If a commit SHA is provided, will list commits up to that SHA.",
-			},
-			"author": {
-				Type:        "string",
-				Description: "Author username or email address to filter commits by",
-			},
-			"path": {
-				Type:        "string",
-				Description: "Only commits containing this file path will be returned",
-			},
-			"since": {
-				Type:        "string",
-				Description: "Only commits after this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
-			},
-			"until": {
-				Type:        "string",
-				Description: "Only commits before this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
-			},
-		},
-		Required: []string{"owner", "repo"},
-	}
-	if includeFields {
-		schema.Properties["fields"] = fieldsSchemaProperty(
-			"Subset of fields to return for each commit. If omitted, all fields are returned. Use this to reduce response size when you only need specific fields, e.g. just 'sha' and 'html_url'.",
-			listCommitsItemFieldEnum,
-		)
-	}
-	WithPagination(schema)
-
-	return NewTool(
+	st := NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "list_commits",
@@ -211,7 +151,44 @@ func listCommitsTool(t translations.TranslationHelperFunc, includeFields bool) i
 				Title:        t("TOOL_LIST_COMMITS_USER_TITLE", "List commits"),
 				ReadOnlyHint: true,
 			},
-			InputSchema: schema,
+			InputSchema: WithPagination(&jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"sha": {
+						Type:        "string",
+						Description: "Commit SHA, branch or tag name to list commits of. If not provided, uses the default branch of the repository. If a commit SHA is provided, will list commits up to that SHA.",
+					},
+					"author": {
+						Type:        "string",
+						Description: "Author username or email address to filter commits by",
+					},
+					"path": {
+						Type:        "string",
+						Description: "Only commits containing this file path will be returned",
+					},
+					"since": {
+						Type:        "string",
+						Description: "Only commits after this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
+					},
+					"until": {
+						Type:        "string",
+						Description: "Only commits before this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
+					},
+					"fields": fieldsSchemaProperty(
+						"Subset of fields to return for each commit.",
+						listCommitsItemFieldEnum,
+					),
+				},
+				Required: []string{"owner", "repo"},
+			}),
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
@@ -235,13 +212,6 @@ func listCommitsTool(t translations.TranslationHelperFunc, includeFields bool) i
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			var fields []string
-			if includeFields {
-				fields, err = OptionalStringArrayParam(args, "fields")
-				if err != nil {
-					return utils.NewToolResultError(err.Error()), nil, nil
-				}
-			}
 			sinceStr, err := OptionalParam[string](args, "since")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
@@ -251,6 +221,10 @@ func listCommitsTool(t translations.TranslationHelperFunc, includeFields bool) i
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			pagination, err := OptionalPaginationParams(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			fields, err := OptionalStringArrayParam(args, "fields")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -287,7 +261,9 @@ func listCommitsTool(t translations.TranslationHelperFunc, includeFields bool) i
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
-			commits, resp, err := client.Repositories.ListCommits(ctx, owner, repo, opts)
+			commits, resp, err := retryGitHubCall(ctx, deps, "list_commits", func(callCtx context.Context) ([]*github.RepositoryCommit, *github.Response, error) {
+				return client.Repositories.ListCommits(callCtx, owner, repo, opts)
+			})
 			if err != nil {
 				return ghErrors.NewGitHubAPIErrorResponse(ctx,
 					fmt.Sprintf("failed to list commits: %s", sha),
@@ -313,24 +289,19 @@ func listCommitsTool(t translations.TranslationHelperFunc, includeFields bool) i
 
 			filtered := false
 			var payload any = minimalCommits
-			if includeFields && len(fields) > 0 {
-				filteredCommits, err := filterEachField(minimalCommits, fields)
+			if len(fields) > 0 {
+				payload, err = filterEachField(minimalCommits, fields)
 				if err != nil {
 					return utils.NewToolResultErrorFromErr("failed to filter commits", err), nil, nil
 				}
-				payload = filteredCommits
 				filtered = true
 			}
-
 			r, err := json.Marshal(payload)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			if includeFields {
-				recordFieldsUsageFor(ctx, deps, "list_commits", minimalCommits, filtered, len(r))
-			}
-
+			recordFieldsUsageFor(ctx, deps, "list_commits", minimalCommits, filtered, len(r))
 			result := utils.NewToolResultText(string(r))
 			// Commit content is reachable from the repo's history; integrity
 			// follows the same public-untrusted / private-trusted rule as file
@@ -339,6 +310,19 @@ func listCommitsTool(t translations.TranslationHelperFunc, includeFields bool) i
 			return result, nil, nil
 		},
 	)
+	st.FeatureFlagEnable = FeatureFlagFieldsParam
+	return st
+}
+
+// LegacyListCommits is the feature-flag-disabled schema variant.
+func LegacyListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := ListCommits(t)
+	st.FeatureFlagEnable = ""
+	if schema, ok := st.Tool.InputSchema.(*jsonschema.Schema); ok {
+		delete(schema.Properties, "fields")
+	}
+	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
+	return st
 }
 
 // ListBranches creates a tool to list branches in a GitHub repository.
@@ -433,13 +417,280 @@ func ListBranches(t translations.TranslationHelperFunc) inventory.ServerTool {
 	)
 }
 
+type ManageBranchResponse struct {
+	Action            string `json:"action"`
+	Branch            string `json:"branch"`
+	ResolvedSourceSHA string `json:"resolved_source_sha,omitempty"`
+	CreatedBranchSHA  string `json:"created_branch_sha,omitempty"`
+	PriorHeadSHA      string `json:"prior_head_sha,omitempty"`
+}
+
+func ManageBranch(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name:        "manage_branch",
+			Description: t("TOOL_MANAGE_BRANCH_DESCRIPTION", "Create or delete a GitHub repository branch with explicit source and head SHA safety checks."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_MANAGE_BRANCH_USER_TITLE", "Manage branch"),
+				ReadOnlyHint:    false,
+				DestructiveHint: github.Ptr(true),
+			},
+			InputSchema: &jsonschema.Schema{
+				Type:                 "object",
+				AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+				Properties: map[string]*jsonschema.Schema{
+					"owner":        {Type: "string", Description: "Repository owner"},
+					"repo":         {Type: "string", Description: "Repository name"},
+					"action":       {Type: "string", Enum: []any{"create", "delete"}, Description: "Branch action to perform"},
+					"branch":       {Type: "string", Description: "Branch name to create or delete"},
+					"source_ref":   {Type: "string", Description: "Source branch name, tag name, or full commit SHA. Required for create."},
+					"expected_sha": {Type: "string", Description: "Expected full commit SHA for the resolved source on create, or current branch head on delete."},
+				},
+				Required: []string{"owner", "repo", "action", "branch"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			action, err := RequiredParam[string](args, "action")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			branch, err := RequiredParam[string](args, "branch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			sourceRef, err := OptionalParam[string](args, "source_ref")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			expectedSHA, err := OptionalParam[string](args, "expected_sha")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if err := validateBranchName(branch); err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if expectedSHA != "" && !looksLikeSHA(expectedSHA) {
+				return utils.NewToolResultError("expected_sha must be a full 40-character commit SHA"), nil, nil
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+
+			switch action {
+			case "create":
+				if strings.TrimSpace(sourceRef) == "" {
+					return utils.NewToolResultError("source_ref is required for create"), nil, nil
+				}
+				existing, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+				closeResponse(resp)
+				if err == nil && existing != nil {
+					return utils.NewToolResultError(fmt.Sprintf("branch %q already exists", branch)), nil, nil
+				}
+				if err != nil && !githubStatusIs(err, http.StatusNotFound) {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to check destination branch", resp, err), nil, nil
+				}
+
+				resolvedSHA, apiResult, err := resolveCommitishToCommitSHA(ctx, client, owner, repo, sourceRef)
+				if apiResult != nil || err != nil {
+					return apiResult, nil, err
+				}
+				if expectedSHA != "" && resolvedSHA != expectedSHA {
+					return utils.NewToolResultError(fmt.Sprintf("expected_sha mismatch: resolved source SHA is %s", resolvedSHA)), nil, nil
+				}
+
+				createdRef, resp, err := client.Git.CreateRef(ctx, owner, repo, github.CreateRef{
+					Ref: "refs/heads/" + branch,
+					SHA: resolvedSHA,
+				})
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create branch", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				return MarshalledTextResult(ManageBranchResponse{
+					Action:            "create",
+					Branch:            branch,
+					ResolvedSourceSHA: resolvedSHA,
+					CreatedBranchSHA:  createdRef.GetObject().GetSHA(),
+				}), nil, nil
+			case "delete":
+				repository, resp, err := client.Repositories.Get(ctx, owner, repo)
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get repository", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				if repository.GetDefaultBranch() == branch {
+					return utils.NewToolResultError("refusing to delete the repository default branch"), nil, nil
+				}
+
+				ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get branch reference", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				prs, resp, err := client.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
+					State: "open",
+					Head:  owner + ":" + branch,
+				})
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to check open pull requests for branch", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				if len(prs) > 0 {
+					return utils.NewToolResultError("refusing to delete branch with an open pull request"), nil, nil
+				}
+				priorHead := ref.GetObject().GetSHA()
+				if expectedSHA != "" && priorHead != expectedSHA {
+					return utils.NewToolResultError(fmt.Sprintf("expected_sha mismatch: current branch head is %s", priorHead)), nil, nil
+				}
+				resp, err = client.Git.DeleteRef(ctx, owner, repo, "heads/"+branch)
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to delete branch", resp, err), nil, nil
+				}
+				closeResponse(resp)
+				return MarshalledTextResult(ManageBranchResponse{
+					Action:       "delete",
+					Branch:       branch,
+					PriorHeadSHA: priorHead,
+				}), nil, nil
+			default:
+				return utils.NewToolResultError(fmt.Sprintf("unknown action: %s", action)), nil, nil
+			}
+		},
+	)
+}
+
+type RepositoryChange struct {
+	Path            string
+	Operation       string
+	Content         string
+	HasContent      bool
+	ExpectedBlobSHA string
+}
+
+type ApplyRepositoryChangesResponse struct {
+	RequestID       string         `json:"request_id"`
+	RequestedTarget map[string]any `json:"requested_target"`
+	AppliedTarget   map[string]any `json:"applied_target"`
+	Changed         bool           `json:"changed"`
+	Verified        bool           `json:"verified"`
+	AuditID         string         `json:"audit_id"`
+	PreviousHeadSHA string         `json:"previous_head_sha"`
+	NewCommitSHA    string         `json:"new_commit_sha"`
+	NewTreeSHA      string         `json:"new_tree_sha"`
+	AddedPaths      []string       `json:"added_paths"`
+	UpdatedPaths    []string       `json:"updated_paths"`
+	DeletedPaths    []string       `json:"deleted_paths"`
+}
+
+func mutationRequestID() string {
+	value := make([]byte, 12)
+	if _, err := cryptorand.Read(value); err != nil {
+		return fmt.Sprintf("ghmcp-%d", time.Now().UnixNano())
+	}
+	return "ghmcp-" + hex.EncodeToString(value)
+}
+
+func ApplyRepositoryChanges(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name:        "apply_repository_changes",
+			Description: t("TOOL_APPLY_REPOSITORY_CHANGES_DESCRIPTION", "Apply multiple file additions, updates, and deletions to a repository branch in one atomic commit."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_APPLY_REPOSITORY_CHANGES_USER_TITLE", "Apply repository changes"),
+				ReadOnlyHint:    false,
+				DestructiveHint: github.Ptr(true),
+			},
+			InputSchema: &jsonschema.Schema{
+				Type:                 "object",
+				AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+				Properties: map[string]*jsonschema.Schema{
+					"owner":             {Type: "string", Description: "Repository owner"},
+					"repo":              {Type: "string", Description: "Repository name"},
+					"branch":            {Type: "string", Description: "Branch to update"},
+					"message":           {Type: "string", Description: "Commit message"},
+					"expected_head_sha": {Type: "string", Description: "Expected current branch head full commit SHA"},
+					"changes": {
+						Type:        "array",
+						Description: "File changes to apply in one commit",
+						Items: &jsonschema.Schema{
+							Type:                 "object",
+							AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+							Properties: map[string]*jsonschema.Schema{
+								"path":              {Type: "string", Description: "Repository-relative file path"},
+								"operation":         {Type: "string", Enum: []any{"upsert", "delete"}, Description: "Change operation"},
+								"content":           {Type: "string", Description: "Required for upsert; forbidden for delete"},
+								"expected_blob_sha": {Type: "string", Description: "Expected current blob SHA. Required for delete and optional for upsert."},
+							},
+							Required: []string{"path", "operation"},
+						},
+					},
+				},
+				Required: []string{"owner", "repo", "branch", "message", "changes"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			branch, err := RequiredParam[string](args, "branch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			message, err := RequiredParam[string](args, "message")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			expectedHeadSHA, err := OptionalParam[string](args, "expected_head_sha")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if expectedHeadSHA != "" && !looksLikeSHA(expectedHeadSHA) {
+				return utils.NewToolResultError("expected_head_sha must be a full 40-character commit SHA"), nil, nil
+			}
+			changes, err := parseRepositoryChanges(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+			result, apiResult, err := applyRepositoryChanges(ctx, client, owner, repo, branch, message, expectedHeadSHA, changes, mutationRequestID())
+			if apiResult != nil || err != nil {
+				return apiResult, nil, err
+			}
+			return MarshalledTextResult(result), nil, nil
+		},
+	)
+}
+
 // CreateOrUpdateFile creates a tool to create or update a file in a GitHub repository.
 func CreateOrUpdateFile(t translations.TranslationHelperFunc) inventory.ServerTool {
 	return NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name: "create_or_update_file",
-			Description: t("TOOL_CREATE_OR_UPDATE_FILE_DESCRIPTION", `Create or update a single file in a GitHub repository. 
+			Description: t("TOOL_CREATE_OR_UPDATE_FILE_DESCRIPTION", `Create or update a single file in a GitHub repository. Supports guarded patch_text, patch_range, and unified_diff operations with expected_blob_sha, expected_occurrences, dry_run preview, and exact content-preservation checks.
 If updating, you should provide the SHA of the file you want to update. Use this tool to create or update a file in a GitHub repository remotely; do not use it for local file operations.
 
 In order to obtain the SHA of original file version before updating, use the following git command:
@@ -470,6 +721,22 @@ SHA MUST be provided for existing file updates.
 						Type:        "string",
 						Description: "Content of the file",
 					},
+					"operation": {
+						Type:        "string",
+						Enum:        []any{"replace", "patch_text", "patch_range", "unified_diff"},
+						Description: "Mutation mode. Omitting this keeps the legacy replace behavior.",
+					},
+					"expected_blob_sha": {
+						Type:        "string",
+						Description: "Current Git blob SHA. Required when modifying an existing file.",
+					},
+					"search":               {Type: "string", Description: "Exact text to find for patch_text."},
+					"replace":              {Type: "string", Description: "Replacement text for patch_text."},
+					"expected_occurrences": {Type: "integer", Description: "Exact number of search matches required."},
+					"start_line":           {Type: "integer", Description: "One-based inclusive start line for patch_range."},
+					"end_line":             {Type: "integer", Description: "One-based inclusive end line for patch_range."},
+					"replacement":          {Type: "string", Description: "Replacement text for patch_range."},
+					"patch":                {Type: "string", Description: "Single-file unified diff for unified_diff."},
 					"message": {
 						Type:        "string",
 						Description: "Commit message",
@@ -482,8 +749,12 @@ SHA MUST be provided for existing file updates.
 						Type:        "string",
 						Description: "The blob SHA of the file being replaced. Required if the file already exists.",
 					},
+					"dry_run": {
+						Type:        "boolean",
+						Description: "Validate the request and report what would happen without writing to GitHub",
+					},
 				},
-				Required: []string{"owner", "repo", "path", "content", "message", "branch"},
+				Required: []string{"owner", "repo", "path", "message", "branch"},
 			},
 		},
 		[]scopes.Scope{scopes.Repo},
@@ -500,7 +771,7 @@ SHA MUST be provided for existing file updates.
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			content, err := RequiredParam[string](args, "content")
+			content, err := OptionalParam[string](args, "content")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -512,119 +783,1151 @@ SHA MUST be provided for existing file updates.
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-
-			// json.Marshal encodes byte arrays with base64, which is required for the API.
-			contentBytes := []byte(content)
-
-			// Create the file options
-			opts := &github.RepositoryContentFileOptions{
-				Message: github.Ptr(message),
-				Content: contentBytes,
-				Branch:  github.Ptr(branch),
-			}
-
-			// If SHA is provided, set it (for updates)
 			sha, err := OptionalParam[string](args, "sha")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			if sha != "" {
-				opts.SHA = github.Ptr(sha)
+			dryRun, err := OptionalParam[bool](args, "dry_run")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			_, operationProvided := args["operation"]
+			operation, err := OptionalParam[string](args, "operation")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			expectedBlobSHA, err := OptionalParam[string](args, "expected_blob_sha")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if expectedBlobSHA == "" {
+				expectedBlobSHA = sha
+			}
+			expectedOccurrences, err := optionalIntArgument(args, "expected_occurrences")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			startLine, err := optionalIntArgument(args, "start_line")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			endLine, err := optionalIntArgument(args, "end_line")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			search, err := OptionalParam[string](args, "search")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			replace, err := OptionalParam[string](args, "replace")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			replacement, err := OptionalParam[string](args, "replacement")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			patch, err := OptionalParam[string](args, "patch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if isSecretLikeRepoPath(path) {
+				return newBlockedFileToolResult(path, "secret_like_file"), nil, nil
+			}
+			if operation == "" {
+				operation = "replace"
+			}
+			if operation == "replace" && content == "" {
+				return utils.NewToolResultError("content is required for replace"), nil, nil
+			}
+			if reason := detectSecretLikeContent(path, content); reason != "" {
+				return newBlockedFileToolResult(path, reason), nil, nil
+			}
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+			if !operationProvided && args["expected_blob_sha"] == nil {
+				return createOrUpdateFileResult(ctx, deps, client, owner, repo, path, content, message, branch, sha)
+			}
+			return createOrUpdateFileOperation(ctx, deps, client, owner, repo, path, message, branch, expectedBlobSHA, dryRun, filePatchInput{
+				Operation: operation, Content: content, Search: search, Replace: replace, ExpectedOccurrences: expectedOccurrences,
+				StartLine: startLine, EndLine: endLine, Replacement: replacement, Patch: patch,
+			})
+		},
+	)
+}
+
+func githubSharedRoot() string {
+	if root := strings.TrimSpace(os.Getenv("GITHUB_MCP_SHARED_ROOT")); root != "" {
+		return root
+	}
+	return "/shared"
+}
+
+const githubSharedMaxBytes = 2 * 1024 * 1024
+
+func resolveSharedPath(sharedPath string) (string, error) {
+	if strings.TrimSpace(sharedPath) == "" {
+		return "", fmt.Errorf("shared_path is required")
+	}
+	if filepath.IsAbs(sharedPath) {
+		return "", fmt.Errorf("shared_path must be relative to the shared directory")
+	}
+	root := filepath.Clean(githubSharedRoot())
+	rootEval, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve shared root: %w", err)
+	}
+	cleaned := filepath.Clean(sharedPath)
+	if cleaned == "." || cleaned == "" {
+		return "", fmt.Errorf("shared_path must point to a file inside the shared directory")
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("shared_path must stay within the shared directory")
+	}
+	joined := filepath.Join(rootEval, cleaned)
+	resolved, err := filepath.EvalSymlinks(joined)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve shared_path: %w", err)
+	}
+	rel, err := filepath.Rel(rootEval, resolved)
+	if err != nil {
+		return "", fmt.Errorf("failed to verify shared_path: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("shared_path must stay within the shared directory")
+	}
+	return resolved, nil
+}
+
+func loadSharedTextFile(sharedPath string, maxBytes int) (string, int, error) {
+	resolved, err := resolveSharedPath(sharedPath)
+	if err != nil {
+		return "", 0, err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to stat shared file: %w", err)
+	}
+	if info.IsDir() {
+		return "", 0, fmt.Errorf("shared_path points to a directory, not a file")
+	}
+	if maxBytes > 0 && info.Size() > int64(maxBytes) {
+		return "", 0, fmt.Errorf("shared file is too large: %d bytes exceeds limit of %d bytes", info.Size(), maxBytes)
+	}
+	contentBytes, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to read shared file: %w", err)
+	}
+	if !utf8.Valid(contentBytes) {
+		return "", 0, fmt.Errorf("shared file is not valid UTF-8 text")
+	}
+	return string(contentBytes), len(contentBytes), nil
+}
+
+type sharedFileSpec struct {
+	RepoPath   string
+	SharedPath string
+	Content    string
+	SizeBytes  int
+}
+
+type SharedPushFilesResponse struct {
+	CommitSHA    string   `json:"commit_sha"`
+	Branch       string   `json:"branch"`
+	ChangedPaths []string `json:"changed_paths"`
+	FileCount    int      `json:"file_count"`
+}
+
+func parseSharedFileSpecs(args map[string]any) ([]sharedFileSpec, error) {
+	filesObj, ok := args["files"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("files parameter must be an array of objects with path and shared_path")
+	}
+	files := make([]sharedFileSpec, 0, len(filesObj))
+	for _, file := range filesObj {
+		fileMap, ok := file.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("each file must be an object with path and shared_path")
+		}
+		repoPath, ok := fileMap["path"].(string)
+		if !ok || strings.TrimSpace(repoPath) == "" {
+			return nil, fmt.Errorf("each file must have a path")
+		}
+		sharedPath, ok := fileMap["shared_path"].(string)
+		if !ok || strings.TrimSpace(sharedPath) == "" {
+			return nil, fmt.Errorf("each file must have a shared_path")
+		}
+		content, sizeBytes, err := loadSharedTextFile(sharedPath, githubSharedMaxBytes)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, sharedFileSpec{
+			RepoPath:   repoPath,
+			SharedPath: sharedPath,
+			Content:    content,
+			SizeBytes:  sizeBytes,
+		})
+	}
+	return files, nil
+}
+
+func prepareBranchBaseCommit(ctx context.Context, client *github.Client, owner, repo, branch string) (*github.Reference, *github.Commit, error) {
+	var repositoryIsEmpty bool
+	var branchNotFound bool
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	if err != nil {
+		ghErr, isGhErr := err.(*github.ErrorResponse)
+		if isGhErr {
+			if ghErr.Response.StatusCode == http.StatusConflict && ghErr.Message == "Git Repository is empty." {
+				repositoryIsEmpty = true
+			} else if ghErr.Response.StatusCode == http.StatusNotFound {
+				branchNotFound = true
+			}
+		}
+		if !repositoryIsEmpty && !branchNotFound {
+			return nil, nil, fmt.Errorf("failed to get branch reference: %w", err)
+		}
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	var baseCommit *github.Commit
+	if !repositoryIsEmpty {
+		if branchNotFound {
+			ref, err = createReferenceFromDefaultBranch(ctx, client, owner, repo, branch)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to create branch from default: %w", err)
+			}
+		}
+		baseCommit, resp, err = client.Git.GetCommit(ctx, owner, repo, *ref.Object.SHA)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get base commit: %w", err)
+		}
+		if resp != nil && resp.Body != nil {
+			defer func() { _ = resp.Body.Close() }()
+		}
+	} else {
+		var base *github.Commit
+		ref, base, err = initializeRepository(ctx, client, owner, repo)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to initialize repository: %w", err)
+		}
+		defaultBranch := strings.TrimPrefix(*ref.Ref, "refs/heads/")
+		if branch != defaultBranch {
+			ref, err = createReferenceFromDefaultBranch(ctx, client, owner, repo, branch)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to create branch from default: %w", err)
+			}
+		}
+		baseCommit = base
+	}
+	return ref, baseCommit, nil
+}
+
+func pushTreeEntries(ctx context.Context, client *github.Client, owner, repo, branch, message string, entries []*github.TreeEntry, changedPaths []string) (*mcp.CallToolResult, any, error) {
+	ref, baseCommit, err := prepareBranchBaseCommit(ctx, client, owner, repo, branch)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	newTree, resp, err := client.Git.CreateTree(ctx, owner, repo, *baseCommit.Tree.SHA, entries)
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx,
+			"failed to create tree",
+			resp,
+			err,
+		), nil, nil
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	commit := github.Commit{
+		Message: github.Ptr(message),
+		Tree:    newTree,
+		Parents: []*github.Commit{{SHA: baseCommit.SHA}},
+	}
+	newCommit, resp, err := client.Git.CreateCommit(ctx, owner, repo, commit, nil)
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx,
+			"failed to create commit",
+			resp,
+			err,
+		), nil, nil
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	_, resp, err = client.Git.UpdateRef(ctx, owner, repo, *ref.Ref, github.UpdateRef{
+		SHA:   *newCommit.SHA,
+		Force: github.Ptr(false),
+	})
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx,
+			"failed to update reference",
+			resp,
+			err,
+		), nil, nil
+	}
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+
+	return MarshalledTextResult(SharedPushFilesResponse{
+		CommitSHA:    newCommit.GetSHA(),
+		Branch:       branch,
+		ChangedPaths: changedPaths,
+		FileCount:    len(changedPaths),
+	}), nil, nil
+}
+
+func firstTextResult(result *mcp.CallToolResult) *mcp.TextContent {
+	if result == nil {
+		return nil
+	}
+	for _, content := range result.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			return text
+		}
+	}
+	return nil
+}
+
+type createOrUpdateFilePreview struct {
+	Owner          string `json:"owner"`
+	Repo           string `json:"repo"`
+	Path           string `json:"path"`
+	Branch         string `json:"branch"`
+	Action         string `json:"action"`
+	RequiresSHA    bool   `json:"requires_sha"`
+	CurrentSHA     string `json:"current_sha,omitempty"`
+	DryRun         bool   `json:"dry_run"`
+	SecretsChecked bool   `json:"secrets_checked"`
+}
+
+func preflightCreateOrUpdateFile(ctx context.Context, client *github.Client, owner, repo, path, branch, sha string) (*createOrUpdateFilePreview, *mcp.CallToolResult, error) {
+	path = strings.TrimPrefix(path, "/")
+	getOpts := &github.RepositoryContentGetOptions{Ref: branch}
+
+	preview := &createOrUpdateFilePreview{
+		Owner:          owner,
+		Repo:           repo,
+		Path:           path,
+		Branch:         branch,
+		DryRun:         true,
+		SecretsChecked: true,
+	}
+
+	existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
+	if respCheck != nil {
+		defer func() { _ = respCheck.Body.Close() }()
+	}
+
+	switch {
+	case getErr != nil:
+		if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
+			return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to check if file exists", respCheck, getErr), nil
+		}
+		preview.Action = "create"
+		preview.RequiresSHA = false
+		return preview, nil, nil
+	case dirContent != nil:
+		return nil, utils.NewToolResultError(fmt.Sprintf(
+			"Path %s is a directory, not a file. This tool only works with files.",
+			path,
+		)), nil
+	case existingFile != nil:
+		currentSHA := existingFile.GetSHA()
+		preview.Action = "update"
+		preview.RequiresSHA = true
+		preview.CurrentSHA = currentSHA
+		if sha == "" {
+			return nil, utils.NewToolResultError(fmt.Sprintf(
+				"File already exists at %s. You must provide the current file's SHA when updating. Use git rev-parse %s:%s to get the blob SHA, then retry with the sha parameter.",
+				path, branch, path,
+			)), nil
+		}
+		if currentSHA != sha {
+			return nil, utils.NewToolResultError(fmt.Sprintf(
+				"SHA mismatch: provided SHA %s is stale. Current file SHA is %s. Pull the latest changes and use git rev-parse %s:%s to get the current SHA.",
+				sha, currentSHA, branch, path,
+			)), nil
+		}
+		return preview, nil, nil
+	}
+
+	return nil, utils.NewToolResultError("failed to prepare file update"), nil
+}
+
+func createOrUpdateFileResult(ctx context.Context, deps ToolDependencies, client *github.Client, owner, repo, path, content, message, branch, sha string) (*mcp.CallToolResult, any, error) {
+	if isSecretLikeRepoPath(path) {
+		return newBlockedFileToolResult(path, "secret_like_file"), nil, nil
+	}
+	if reason := detectSecretLikeContent(path, content); reason != "" {
+		return newBlockedFileToolResult(path, reason), nil, nil
+	}
+
+	// json.Marshal encodes byte arrays with base64, which is required for the API.
+	contentBytes := []byte(content)
+
+	// Create the file options
+	opts := &github.RepositoryContentFileOptions{
+		Message: github.Ptr(message),
+		Content: contentBytes,
+		Branch:  github.Ptr(branch),
+	}
+	if sha != "" {
+		opts.SHA = github.Ptr(sha)
+	}
+
+	path = strings.TrimPrefix(path, "/")
+	if _, previewResult, previewErr := preflightCreateOrUpdateFile(ctx, client, owner, repo, path, branch, sha); previewResult != nil || previewErr != nil {
+		return previewResult, nil, previewErr
+	}
+
+	fileContent, resp, err := client.Repositories.CreateFile(ctx, owner, repo, path, opts)
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx,
+			"failed to create/update file",
+			resp,
+			err,
+		), nil, nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read response body: %w", err)
+		}
+		return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to create/update file", resp, body), nil, nil
+	}
+
+	minimalResponse := convertToMinimalFileContentResponse(fileContent)
+	return MarshalledTextResult(minimalResponse), nil, nil
+}
+
+func decodeGitHubFileContent(file *github.RepositoryContent) (string, error) {
+	if file == nil || file.Content == nil {
+		return "", fmt.Errorf("GitHub did not return complete file content")
+	}
+	encodedContent, err := file.GetContent()
+	if err != nil {
+		return "", fmt.Errorf("failed to read current GitHub blob content: %w", err)
+	}
+	return encodedContent, nil
+}
+
+func boundedRedactedPreview(content string) string {
+	redacted, _ := redactSecretLikeContent(content)
+	if len(redacted) > 4000 {
+		return redacted[:4000] + "\n...[truncated]"
+	}
+	return redacted
+}
+
+func optionalIntArgument(args map[string]any, key string) (int, error) {
+	value, ok := args[key]
+	if !ok || value == nil {
+		return 0, nil
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed, nil
+	case int64:
+		return int(typed), nil
+	case float64:
+		if typed != float64(int(typed)) {
+			return 0, fmt.Errorf("parameter %s must be an integer", key)
+		}
+		return int(typed), nil
+	default:
+		return 0, fmt.Errorf("parameter %s is not of type int, is %T", key, value)
+	}
+}
+
+func getCurrentGitHubFile(ctx context.Context, client *github.Client, owner, repo, path, branch string) (*github.RepositoryContent, string, *github.Response, error) {
+	file, dirs, resp, err := client.Repositories.GetContents(ctx, owner, repo, strings.TrimPrefix(path, "/"), &github.RepositoryContentGetOptions{Ref: branch})
+	if err != nil {
+		return nil, "", resp, err
+	}
+	if dirs != nil {
+		return nil, "", resp, fmt.Errorf("path %s is a directory, not a file", path)
+	}
+	content, err := decodeGitHubFileContent(file)
+	if err != nil {
+		return file, "", resp, err
+	}
+	return file, content, resp, nil
+}
+
+func closeResponse(resp *github.Response) {
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func githubStatusIs(err error, status int) bool {
+	ghErr, ok := err.(*github.ErrorResponse)
+	return ok && ghErr.Response != nil && ghErr.Response.StatusCode == status
+}
+
+func validateBranchName(branch string) error {
+	if strings.TrimSpace(branch) == "" {
+		return fmt.Errorf("branch is required")
+	}
+	if strings.HasPrefix(branch, "refs/") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") || strings.Contains(branch, "..") {
+		return fmt.Errorf("invalid branch name")
+	}
+	return nil
+}
+
+func resolveCommitishToCommitSHA(ctx context.Context, client *github.Client, owner, repo, sourceRef string) (string, *mcp.CallToolResult, error) {
+	sourceRef = strings.TrimSpace(sourceRef)
+	if looksLikeSHA(sourceRef) {
+		commit, resp, err := client.Git.GetCommit(ctx, owner, repo, sourceRef)
+		if err != nil {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source commit", resp, err), nil
+		}
+		closeResponse(resp)
+		return commit.GetSHA(), nil, nil
+	}
+
+	var refName string
+	switch {
+	case strings.HasPrefix(sourceRef, "refs/"):
+		refName = sourceRef
+	case strings.HasPrefix(sourceRef, "heads/") || strings.HasPrefix(sourceRef, "tags/"):
+		refName = "refs/" + sourceRef
+	default:
+		branchRef := "refs/heads/" + sourceRef
+		ref, resp, err := client.Git.GetRef(ctx, owner, repo, branchRef)
+		if err == nil {
+			closeResponse(resp)
+			return peelReferenceToCommitSHA(ctx, client, owner, repo, ref)
+		}
+		closeResponse(resp)
+		if !githubStatusIs(err, http.StatusNotFound) {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source branch", resp, err), nil
+		}
+		refName = "refs/tags/" + sourceRef
+	}
+
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, refName)
+	if err != nil {
+		return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source ref", resp, err), nil
+	}
+	closeResponse(resp)
+	return peelReferenceToCommitSHA(ctx, client, owner, repo, ref)
+}
+
+func peelReferenceToCommitSHA(ctx context.Context, client *github.Client, owner, repo string, ref *github.Reference) (string, *mcp.CallToolResult, error) {
+	if ref == nil || ref.Object == nil {
+		return "", utils.NewToolResultError("source ref did not resolve to an object"), nil
+	}
+	switch ref.GetObject().GetType() {
+	case "", "commit":
+		sha := ref.GetObject().GetSHA()
+		commit, resp, err := client.Git.GetCommit(ctx, owner, repo, sha)
+		if err != nil {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source commit", resp, err), nil
+		}
+		closeResponse(resp)
+		return commit.GetSHA(), nil, nil
+	case "tag":
+		tag, resp, err := client.Git.GetTag(ctx, owner, repo, ref.GetObject().GetSHA())
+		if err != nil {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve source tag", resp, err), nil
+		}
+		closeResponse(resp)
+		if tag.GetObject().GetType() != "commit" {
+			return "", utils.NewToolResultError("source tag does not point to a commit"), nil
+		}
+		commit, resp, err := client.Git.GetCommit(ctx, owner, repo, tag.GetObject().GetSHA())
+		if err != nil {
+			return "", ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to resolve tagged commit", resp, err), nil
+		}
+		closeResponse(resp)
+		return commit.GetSHA(), nil, nil
+	default:
+		return "", utils.NewToolResultError("source ref does not point to a commit"), nil
+	}
+}
+
+func parseRepositoryChanges(args map[string]any) ([]RepositoryChange, error) {
+	rawChanges, ok := args["changes"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("changes parameter must be an array")
+	}
+	if len(rawChanges) == 0 {
+		return nil, fmt.Errorf("changes must not be empty")
+	}
+	seen := make(map[string]struct{}, len(rawChanges))
+	changes := make([]RepositoryChange, 0, len(rawChanges))
+	for _, rawChange := range rawChanges {
+		changeMap, ok := rawChange.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("each change must be an object")
+		}
+		path, _ := changeMap["path"].(string)
+		operation, _ := changeMap["operation"].(string)
+		content, hasContent := changeMap["content"].(string)
+		expectedBlobSHA, _ := changeMap["expected_blob_sha"].(string)
+		if err := validateRepositoryChangePath(path); err != nil {
+			return nil, err
+		}
+		if _, exists := seen[path]; exists {
+			return nil, fmt.Errorf("duplicate path in changes: %s", path)
+		}
+		seen[path] = struct{}{}
+		switch operation {
+		case "upsert":
+			if !hasContent {
+				return nil, fmt.Errorf("content is required for upsert: %s", path)
+			}
+			if expectedBlobSHA != "" && !looksLikeSHA(expectedBlobSHA) {
+				return nil, fmt.Errorf("expected_blob_sha must be a full SHA for %s", path)
+			}
+			if isSecretLikeRepoPath(path) {
+				return nil, fmt.Errorf("path is blocked by repository safety policy: %s", path)
+			}
+			if reason := detectSecretLikeContent(path, content); reason != "" {
+				return nil, fmt.Errorf("content for %s is blocked by repository safety policy: %s", path, reason)
+			}
+		case "delete":
+			if hasContent {
+				return nil, fmt.Errorf("content is not allowed for delete: %s", path)
+			}
+			if expectedBlobSHA == "" {
+				return nil, fmt.Errorf("expected_blob_sha is required for delete: %s", path)
+			}
+			if !looksLikeSHA(expectedBlobSHA) {
+				return nil, fmt.Errorf("expected_blob_sha must be a full SHA for %s", path)
+			}
+		default:
+			return nil, fmt.Errorf("unknown operation for %s: %s", path, operation)
+		}
+		changes = append(changes, RepositoryChange{
+			Path:            path,
+			Operation:       operation,
+			Content:         content,
+			HasContent:      hasContent,
+			ExpectedBlobSHA: expectedBlobSHA,
+		})
+	}
+	return changes, nil
+}
+
+func validateRepositoryChangePath(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("path is required")
+	}
+	if strings.HasPrefix(path, "/") {
+		return fmt.Errorf("absolute paths are not allowed: %s", path)
+	}
+	cleaned := filepath.Clean(path)
+	if cleaned != path || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.HasSuffix(path, "/") {
+		return fmt.Errorf("invalid repository file path: %s", path)
+	}
+	return nil
+}
+
+func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, repo, branch, message, expectedHeadSHA string, changes []RepositoryChange, requestID string) (*ApplyRepositoryChangesResponse, *mcp.CallToolResult, error) {
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get branch reference", resp, err), nil
+	}
+	closeResponse(resp)
+	previousHead := ref.GetObject().GetSHA()
+	if expectedHeadSHA != "" && previousHead != expectedHeadSHA {
+		return nil, utils.NewToolResultError(fmt.Sprintf("expected_head_sha mismatch: current branch head is %s", previousHead)), nil
+	}
+
+	baseCommit, resp, err := client.Git.GetCommit(ctx, owner, repo, previousHead)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get base commit", resp, err), nil
+	}
+	closeResponse(resp)
+	tree, resp, err := client.Git.GetTree(ctx, owner, repo, baseCommit.GetTree().GetSHA(), true)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get base tree", resp, err), nil
+	}
+	closeResponse(resp)
+	if tree.GetTruncated() {
+		return nil, utils.NewToolResultError("base tree is truncated; refusing to validate atomic changes against incomplete tree"), nil
+	}
+
+	entriesByPath := make(map[string]*github.TreeEntry, len(tree.Entries))
+	for _, entry := range tree.Entries {
+		entriesByPath[entry.GetPath()] = entry
+	}
+	treeEntries := make([]*github.TreeEntry, 0, len(changes))
+	added := make([]string, 0)
+	updated := make([]string, 0)
+	deleted := make([]string, 0)
+
+	for _, change := range changes {
+		if entry, ok := entriesByPath[change.Path]; ok && entry.GetType() == "tree" {
+			return nil, utils.NewToolResultError(fmt.Sprintf("path is a directory, not a file: %s", change.Path)), nil
+		}
+		entry, exists := entriesByPath[change.Path]
+		switch change.Operation {
+		case "upsert":
+			if exists {
+				if entry.GetType() != "blob" {
+					return nil, utils.NewToolResultError(fmt.Sprintf("path is not a file: %s", change.Path)), nil
+				}
+				if change.ExpectedBlobSHA != "" && entry.GetSHA() != change.ExpectedBlobSHA {
+					return nil, utils.NewToolResultError(fmt.Sprintf("expected_blob_sha mismatch for %s: current blob SHA is %s", change.Path, entry.GetSHA())), nil
+				}
+				updated = append(updated, change.Path)
+			} else {
+				if change.ExpectedBlobSHA != "" {
+					return nil, utils.NewToolResultError(fmt.Sprintf("expected_blob_sha supplied for missing path: %s", change.Path)), nil
+				}
+				added = append(added, change.Path)
+			}
+			treeEntries = append(treeEntries, &github.TreeEntry{
+				Path:    github.Ptr(change.Path),
+				Mode:    github.Ptr("100644"),
+				Type:    github.Ptr("blob"),
+				Content: github.Ptr(change.Content),
+			})
+		case "delete":
+			if !exists {
+				return nil, utils.NewToolResultError(fmt.Sprintf("cannot delete missing path: %s", change.Path)), nil
+			}
+			if entry.GetType() != "blob" {
+				return nil, utils.NewToolResultError(fmt.Sprintf("path is not a file: %s", change.Path)), nil
+			}
+			if entry.GetSHA() != change.ExpectedBlobSHA {
+				return nil, utils.NewToolResultError(fmt.Sprintf("expected_blob_sha mismatch for %s: current blob SHA is %s", change.Path, entry.GetSHA())), nil
+			}
+			deleted = append(deleted, change.Path)
+			treeEntries = append(treeEntries, &github.TreeEntry{
+				Path: github.Ptr(change.Path),
+				Mode: github.Ptr("100644"),
+				Type: github.Ptr("blob"),
+				SHA:  nil,
+			})
+		}
+	}
+
+	newTree, resp, err := client.Git.CreateTree(ctx, owner, repo, baseCommit.GetTree().GetSHA(), treeEntries)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create tree", resp, err), nil
+	}
+	closeResponse(resp)
+	newCommit, resp, err := client.Git.CreateCommit(ctx, owner, repo, github.Commit{
+		Message: github.Ptr(message),
+		Tree:    newTree,
+		Parents: []*github.Commit{{SHA: github.Ptr(previousHead)}},
+	}, nil)
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create commit", resp, err), nil
+	}
+	closeResponse(resp)
+	_, resp, err = client.Git.UpdateRef(ctx, owner, repo, ref.GetRef(), github.UpdateRef{
+		SHA:   newCommit.GetSHA(),
+		Force: github.Ptr(false),
+	})
+	if err != nil {
+		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to update reference", resp, err), nil
+	}
+	closeResponse(resp)
+	verifiedRef, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	if err != nil || verifiedRef == nil || verifiedRef.GetObject().GetSHA() != newCommit.GetSHA() {
+		closeResponse(resp)
+		return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: branch head does not belong to the requested repository/branch"), nil
+	}
+	closeResponse(resp)
+	verifiedCommit, resp, err := client.Git.GetCommit(ctx, owner, repo, newCommit.GetSHA())
+	if err != nil || verifiedCommit == nil || verifiedCommit.GetSHA() != newCommit.GetSHA() || len(verifiedCommit.Parents) == 0 || verifiedCommit.Parents[0].GetSHA() != previousHead {
+		closeResponse(resp)
+		return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: returned commit or parent does not match the requested repository/branch"), nil
+	}
+	closeResponse(resp)
+	verifiedTree, resp, err := client.Git.GetTree(ctx, owner, repo, verifiedCommit.GetTree().GetSHA(), true)
+	if err != nil || verifiedTree == nil || verifiedTree.GetTruncated() {
+		closeResponse(resp)
+		return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: returned commit tree could not be verified"), nil
+	}
+	closeResponse(resp)
+	beforeByPath := entriesByPath
+	afterByPath := make(map[string]*github.TreeEntry, len(verifiedTree.Entries))
+	for _, entry := range verifiedTree.Entries {
+		afterByPath[entry.GetPath()] = entry
+	}
+	requestedPaths := make(map[string]struct{}, len(changes))
+	for _, change := range changes {
+		requestedPaths[change.Path] = struct{}{}
+	}
+	requestedPathList := make([]string, 0, len(requestedPaths))
+	for path := range requestedPaths {
+		requestedPathList = append(requestedPathList, path)
+	}
+	for path := range beforeByPath {
+		if _, requested := requestedPaths[path]; requested {
+			continue
+		}
+		if beforeByPath[path].GetSHA() != afterByPath[path].GetSHA() {
+			return nil, utils.NewToolResultError("TARGET_MISMATCH: an unrequested repository path changed"), nil
+		}
+	}
+	for path := range afterByPath {
+		if _, requested := requestedPaths[path]; requested {
+			continue
+		}
+		if beforeByPath[path] == nil {
+			return nil, utils.NewToolResultError("TARGET_MISMATCH: an unrequested repository path was added"), nil
+		}
+	}
+	for _, change := range changes {
+		entry, exists := afterByPath[change.Path]
+		if change.Operation == "delete" && exists {
+			return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: requested path was not deleted"), nil
+		}
+		if change.Operation == "upsert" && (!exists || entry.GetType() != "blob") {
+			return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: requested path was not written as a blob"), nil
+		}
+	}
+	return &ApplyRepositoryChangesResponse{
+		RequestID:       requestID,
+		RequestedTarget: map[string]any{"owner": owner, "repo": repo, "branch": branch, "paths": requestedPathList},
+		AppliedTarget:   map[string]any{"owner": owner, "repo": repo, "branch": branch, "commit_sha": newCommit.GetSHA()},
+		Changed:         true,
+		Verified:        true,
+		AuditID:         requestID,
+		PreviousHeadSHA: previousHead,
+		NewCommitSHA:    newCommit.GetSHA(),
+		NewTreeSHA:      newTree.GetSHA(),
+		AddedPaths:      added,
+		UpdatedPaths:    updated,
+		DeletedPaths:    deleted,
+	}, nil, nil
+}
+
+func createOrUpdateFileOperation(ctx context.Context, deps ToolDependencies, client *github.Client, owner, repo, path, message, branch, expectedSHA string, dryRun bool, patch filePatchInput) (*mcp.CallToolResult, any, error) {
+	path = strings.TrimPrefix(path, "/")
+	file, before, resp, err := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	exists := err == nil && file != nil
+	if err != nil && (resp == nil || resp.StatusCode != http.StatusNotFound) {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to fetch current file before mutation", resp, err), nil, nil
+	}
+	if !exists && patch.Operation != "replace" {
+		return utils.NewToolResultError("patch operations require an existing file"), nil, nil
+	}
+	if exists {
+		if expectedSHA == "" {
+			return utils.NewToolResultError(fmt.Sprintf("File already exists at %s. You must provide expected_blob_sha when modifying it.", path)), nil, nil
+		}
+		if expectedSHA != file.GetSHA() {
+			return utils.NewToolResultError(fmt.Sprintf("SHA mismatch: provided SHA %s is stale. Current file SHA is %s.", expectedSHA, file.GetSHA())), nil, nil
+		}
+	}
+	if patch.Operation == "replace" && !exists {
+		before = ""
+	}
+	after, patchPreview, err := applyFilePatch(before, patch)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	if reason := detectSecretLikeContent(path, after); reason != "" {
+		return newBlockedFileToolResult(path, reason), nil, nil
+	}
+	if !unrelatedFileContentPreserved(before, after, patch) {
+		return utils.NewToolResultError("resulting file did not preserve unrelated content"), nil, nil
+	}
+	redactedBefore, _ := redactSecretLikeContent(before)
+	redactedAfter, _ := redactSecretLikeContent(after)
+	bounded := func(value string) string {
+		if len(value) > 4000 {
+			return value[:4000] + "\n...[truncated]"
+		}
+		return value
+	}
+	preview := map[string]any{
+		"ok": true, "dry_run": dryRun, "operation": patchPreview.Operation, "owner": owner, "repo": repo, "path": path, "branch": branch,
+		"action": map[bool]string{true: "update", false: "create"}[exists], "expected_blob_sha": expectedSHA, "matched_occurrences": patchPreview.MatchedOccurrences,
+		"changed_line_count": patchPreview.ChangedLineCount, "hunks": patchPreview.Hunks, "before_preview": bounded(redactedBefore), "after_preview": bounded(redactedAfter), "redacted": redactedBefore != before || redactedAfter != after,
+	}
+	if dryRun {
+		return MarshalledTextResult(preview), nil, nil
+	}
+	options := &github.RepositoryContentFileOptions{Message: github.Ptr(message), Content: []byte(after), Branch: github.Ptr(branch)}
+	if exists {
+		options.SHA = github.Ptr(expectedSHA)
+	}
+	committed, writeResp, err := client.Repositories.CreateFile(ctx, owner, repo, path, options)
+	if writeResp != nil && writeResp.Body != nil {
+		defer func() { _ = writeResp.Body.Close() }()
+	}
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to create/update file", writeResp, err), nil, nil
+	}
+	var verified *github.RepositoryContent
+	var committedContent string
+	var verifyErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		var verifyResp *github.Response
+		verified, committedContent, verifyResp, verifyErr = getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+		if verifyResp != nil && verifyResp.Body != nil {
+			_ = verifyResp.Body.Close()
+		}
+		if verifyErr == nil && committedContent == after {
+			break
+		}
+		if attempt < 4 {
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+	if verifyErr != nil {
+		return utils.NewToolResultError(fmt.Sprintf("post-commit verification failed: %v", verifyErr)), nil, nil
+	}
+	if committedContent != after {
+		return utils.NewToolResultError("post-commit verification failed: committed content does not match the requested change"), nil, nil
+	}
+	commitSHA := committed.Commit.GetSHA()
+	if commitSHA == "" {
+		return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: GitHub did not return a commit SHA for the requested file"), nil, nil
+	}
+	verifiedRef, verifyRefResp, verifyRefErr := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+	closeResponse(verifyRefResp)
+	if verifyRefErr != nil || verifiedRef == nil || verifiedRef.GetObject().GetSHA() != commitSHA {
+		return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: file commit does not belong to the requested repository branch"), nil, nil
+	}
+	if exists && verified.GetSHA() == expectedSHA {
+		return utils.NewToolResultError("post-commit verification failed: blob SHA did not change"), nil, nil
+	}
+	requestID := mutationRequestID()
+	return MarshalledTextResult(map[string]any{
+		"ok":               true,
+		"applied":          true,
+		"requested_target": map[string]any{"owner": owner, "repo": repo, "branch": branch, "path": path, "expected_blob_sha": expectedSHA},
+		"applied_target":   map[string]any{"owner": owner, "repo": repo, "branch": branch, "path": path, "commit_sha": commitSHA, "blob_sha": verified.GetSHA()},
+		"changed":          true,
+		"verified":         true,
+		"request_id":       requestID,
+		"audit_id":         requestID,
+		"verification":     map[string]any{"ok": true, "exact_content": true, "unrelated_content_preserved": true},
+		"content":          convertToMinimalFileContentResponse(committed),
+	}), nil, nil
+}
+
+func CreateOrUpdateFileFromSharedPath(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name: "create_or_update_file_from_shared_path",
+			Description: t("TOOL_CREATE_OR_UPDATE_FILE_FROM_SHARED_PATH_DESCRIPTION", `Create or update a single file in a GitHub repository using a UTF-8 text file that already exists on the MCP host under the shared directory.
+
+Use this when the file content is already available on the server and is too large or too awkward to send inline through the MCP tool call.
+
+Only files inside the configured shared directory are allowed. SHA MUST be provided for existing file updates.`),
+			Annotations: &mcp.ToolAnnotations{
+				Title:        t("TOOL_CREATE_OR_UPDATE_FILE_FROM_SHARED_PATH_USER_TITLE", "Create or update file from shared path"),
+				ReadOnlyHint: false,
+			},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (username or organization)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"path": {
+						Type:        "string",
+						Description: "Repository path where to create/update the file",
+					},
+					"shared_path": {
+						Type:        "string",
+						Description: "Relative path under the shared directory mounted into the MCP container",
+					},
+					"message": {
+						Type:        "string",
+						Description: "Commit message",
+					},
+					"branch": {
+						Type:        "string",
+						Description: "Branch to create/update the file in",
+					},
+					"sha": {
+						Type:        "string",
+						Description: "The blob SHA of the file being replaced. Required if the file already exists.",
+					},
+				},
+				Required: []string{"owner", "repo", "path", "shared_path", "message", "branch"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			path, err := RequiredParam[string](args, "path")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			sharedPath, err := RequiredParam[string](args, "shared_path")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			message, err := RequiredParam[string](args, "message")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			branch, err := RequiredParam[string](args, "branch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			sha, err := OptionalParam[string](args, "sha")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 
-			// Create or update the file
+			content, sizeBytes, err := loadSharedTextFile(sharedPath, githubSharedMaxBytes)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
 			client, err := deps.GetClient(ctx)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
 
-			path = strings.TrimPrefix(path, "/")
-
-			// SHA validation using Contents API to fetch current file metadata (blob SHA)
-			getOpts := &github.RepositoryContentGetOptions{Ref: branch}
-
-			if sha != "" {
-				// User provided SHA - validate it's still current
-				existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
-				if respCheck != nil {
-					_ = respCheck.Body.Close()
-				}
-				switch {
-				case getErr != nil:
-					// 404 means file doesn't exist - proceed (new file creation)
-					// Any other error (403, 500, network) should be surfaced
-					if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
-						return ghErrors.NewGitHubAPIErrorResponse(ctx,
-							"failed to verify file SHA",
-							respCheck,
-							getErr,
-						), nil, nil
-					}
-				case dirContent != nil:
-					return utils.NewToolResultError(fmt.Sprintf(
-						"Path %s is a directory, not a file. This tool only works with files.",
-						path)), nil, nil
-				case existingFile != nil:
-					currentSHA := existingFile.GetSHA()
-					if currentSHA != sha {
-						return utils.NewToolResultError(fmt.Sprintf(
-							"SHA mismatch: provided SHA %s is stale. Current file SHA is %s. "+
-								"Pull the latest changes and use git rev-parse %s:%s to get the current SHA.",
-							sha, currentSHA, branch, path)), nil, nil
-					}
-				}
-			} else {
-				// No SHA provided - check if file already exists
-				existingFile, dirContent, respCheck, getErr := client.Repositories.GetContents(ctx, owner, repo, path, getOpts)
-				if respCheck != nil {
-					_ = respCheck.Body.Close()
-				}
-				switch {
-				case getErr != nil:
-					// 404 means file doesn't exist - proceed with creation
-					// Any other error (403, 500, network) should be surfaced
-					if respCheck == nil || respCheck.StatusCode != http.StatusNotFound {
-						return ghErrors.NewGitHubAPIErrorResponse(ctx,
-							"failed to check if file exists",
-							respCheck,
-							getErr,
-						), nil, nil
-					}
-				case dirContent != nil:
-					return utils.NewToolResultError(fmt.Sprintf(
-						"Path %s is a directory, not a file. This tool only works with files.",
-						path)), nil, nil
-				case existingFile != nil:
-					// File exists but no SHA was provided - reject to prevent blind overwrites
-					return utils.NewToolResultError(fmt.Sprintf(
-						"File already exists at %s. You must provide the current file's SHA when updating. "+
-							"Use git rev-parse %s:%s to get the blob SHA, then retry with the sha parameter.",
-						path, branch, path)), nil, nil
-				}
-				// If file not found, no previous SHA needed (new file creation)
+			result, _, err := createOrUpdateFileResult(ctx, deps, client, owner, repo, path, content, message, branch, sha)
+			if err != nil || result == nil || result.IsError {
+				return result, nil, err
 			}
 
-			fileContent, resp, err := client.Repositories.CreateFile(ctx, owner, repo, path, opts)
+			textResult := firstTextResult(result)
+			if textResult == nil {
+				return result, nil, nil
+			}
+
+			var structured map[string]any
+			if unmarshalErr := json.Unmarshal([]byte(textResult.Text), &structured); unmarshalErr == nil {
+				structured["source"] = map[string]any{
+					"type":        "shared_path",
+					"shared_path": sharedPath,
+					"size_bytes":  sizeBytes,
+				}
+				result.StructuredContent = structured
+			}
+
+			return result, nil, nil
+		},
+	)
+}
+
+func PushFilesFromSharedPaths(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name:        "push_files_from_shared_paths",
+			Description: t("TOOL_PUSH_FILES_FROM_SHARED_PATHS_DESCRIPTION", "Push multiple UTF-8 text files from the shared directory to a GitHub repository in a single commit."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:        t("TOOL_PUSH_FILES_FROM_SHARED_PATHS_USER_TITLE", "Push files from shared paths"),
+				ReadOnlyHint: false,
+			},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"branch": {
+						Type:        "string",
+						Description: "Branch to push to",
+					},
+					"message": {
+						Type:        "string",
+						Description: "Commit message",
+					},
+					"files": {
+						Type:        "array",
+						Description: "Array of file objects to push, each object with path (repository path) and shared_path (relative path under the shared directory)",
+						Items: &jsonschema.Schema{
+							Type:                 "object",
+							AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+							Properties: map[string]*jsonschema.Schema{
+								"path": {
+									Type:        "string",
+									Description: "Repository path for the file",
+								},
+								"shared_path": {
+									Type:        "string",
+									Description: "Relative path under the shared directory mounted into the MCP container",
+								},
+							},
+							Required: []string{"path", "shared_path"},
+						},
+					},
+				},
+				Required: []string{"owner", "repo", "branch", "files", "message"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
 			if err != nil {
-				return ghErrors.NewGitHubAPIErrorResponse(ctx,
-					"failed to create/update file",
-					resp,
-					err,
-				), nil, nil
+				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			defer func() { _ = resp.Body.Close() }()
-
-			if resp.StatusCode != 200 && resp.StatusCode != 201 {
-				body, err := io.ReadAll(resp.Body)
-				if err != nil {
-					return nil, nil, fmt.Errorf("failed to read response body: %w", err)
-				}
-				return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to create/update file", resp, body), nil, nil
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			branch, err := RequiredParam[string](args, "branch")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			message, err := RequiredParam[string](args, "message")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			files, err := parseSharedFileSpecs(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
 
-			minimalResponse := convertToMinimalFileContentResponse(fileContent)
+			entries := make([]*github.TreeEntry, 0, len(files))
+			changedPaths := make([]string, 0, len(files))
+			for _, file := range files {
+				entries = append(entries, &github.TreeEntry{
+					Path:    github.Ptr(file.RepoPath),
+					Mode:    github.Ptr("100644"),
+					Type:    github.Ptr("blob"),
+					Content: github.Ptr(file.Content),
+				})
+				changedPaths = append(changedPaths, file.RepoPath)
+			}
 
-			return MarshalledTextResult(minimalResponse), nil, nil
+			return pushTreeEntries(ctx, client, owner, repo, branch, message, entries, changedPaths)
 		},
 	)
 }
@@ -750,70 +2053,271 @@ func FetchRepoIsPrivate(ctx context.Context, client *github.Client, owner, repo 
 	return r.GetPrivate(), nil
 }
 
-// GetFileContents creates a tool to get the contents of a file or directory from
-// a GitHub repository. It is the FeatureFlagFieldsParam-enabled variant: it
-// advertises the optional `fields` parameter and filters directory listings to
-// the requested subset. Both this and LegacyGetFileContents register under the
-// tool name "get_file_contents"; exactly one is active for any given request
-// thanks to mutually exclusive FeatureFlagEnable / FeatureFlagDisable annotations.
-func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool {
-	st := getFileContentsTool(t, true)
-	st.FeatureFlagEnable = FeatureFlagFieldsParam
-	return st
+func isSecretLikeRepoPath(path string) bool {
+	lower := strings.ToLower(strings.TrimSpace(path))
+	base := filepath.Base(lower)
+	switch {
+	case lower == ".env",
+		strings.HasPrefix(base, ".env."),
+		base == "id_rsa",
+		base == "id_ed25519",
+		strings.HasSuffix(base, ".pem"),
+		strings.HasSuffix(base, ".key"),
+		base == "credentials.json",
+		strings.Contains(base, "service-account") && strings.HasSuffix(base, ".json"),
+		strings.HasSuffix(base, ".sql"),
+		strings.HasSuffix(base, ".dump"),
+		strings.HasSuffix(base, ".bak"),
+		strings.HasSuffix(base, ".sqlite"),
+		strings.HasSuffix(base, ".sqlite3"):
+		return true
+	default:
+		return false
+	}
 }
 
-// LegacyGetFileContents is the FeatureFlagFieldsParam-disabled variant of
-// get_file_contents. It exposes the original schema (no `fields` parameter) and
-// never filters directory listings, so it acts as the kill switch when the flag
-// is off. It owns the canonical get_file_contents.snap; the flag-enabled variant
-// owns get_file_contents_ff_<flag>.snap. Delete this function when the flag is
-// removed.
-func LegacyGetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool {
-	st := getFileContentsTool(t, false)
-	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
-	return st
+var secretLikeContentPatterns = []struct {
+	reason string
+	regex  *regexp.Regexp
+}{
+	{reason: "private_key_material", regex: regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)},
+	{reason: "github_token", regex: regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`)},
+	{reason: "aws_access_key", regex: regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
+	{reason: "openai_api_key", regex: regexp.MustCompile(`\bsk-(?:live|proj|ant)-[A-Za-z0-9]{16,}\b`)},
+	{reason: "slack_token", regex: regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}\b`)},
 }
 
-// getFileContentsTool builds the get_file_contents tool. When includeFields is
-// true the tool advertises the optional `fields` parameter, filters directory
-// listings to the requested subset, and emits fields telemetry. When false it is
-// the original tool with no fields parameter and no filtering.
-func getFileContentsTool(t translations.TranslationHelperFunc, includeFields bool) inventory.ServerTool {
-	schema := &jsonschema.Schema{
-		Type: "object",
-		Properties: map[string]*jsonschema.Schema{
-			"owner": {
-				Type:        "string",
-				Description: "Repository owner (username or organization)",
-			},
-			"repo": {
-				Type:        "string",
-				Description: "Repository name",
-			},
-			"path": {
-				Type:        "string",
-				Description: "Path to file/directory",
-				Default:     json.RawMessage(`"/"`),
-			},
-			"ref": {
-				Type:        "string",
-				Description: "Accepts optional git refs such as `refs/tags/{tag}`, `refs/heads/{branch}` or `refs/pull/{pr_number}/head`",
-			},
-			"sha": {
-				Type:        "string",
-				Description: "Accepts optional commit SHA. If specified, it will be used instead of ref",
+var secretRedactionPatterns = []struct {
+	regex       *regexp.Regexp
+	replacement string
+}{
+	{
+		regex:       regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`),
+		replacement: "***REDACTED PRIVATE KEY***",
+	},
+	{
+		regex:       regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`),
+		replacement: "***REDACTED GITHUB TOKEN***",
+	},
+	{
+		regex:       regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+		replacement: "***REDACTED AWS KEY***",
+	},
+	{
+		regex:       regexp.MustCompile(`\bsk-(?:live|proj|ant)-[A-Za-z0-9]{16,}\b`),
+		replacement: "***REDACTED API KEY***",
+	},
+	{
+		regex:       regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}\b`),
+		replacement: "***REDACTED SLACK TOKEN***",
+	},
+	{
+		regex:       regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._\-+/=]{12,}\b`),
+		replacement: "Bearer ***REDACTED***",
+	},
+	{
+		regex:       regexp.MustCompile(`(?im)^([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*[:=]\s*).+$`),
+		replacement: "${1}***REDACTED***",
+	},
+	{
+		regex:       regexp.MustCompile(`(?i)\b((?:access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|webhook[_-]?secret|password|private[_-]?key)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^'",\s]+)`),
+		replacement: "${1}***REDACTED***",
+	},
+}
+
+func detectSecretLikeContent(path, content string) string {
+	if isSecretLikeRepoPath(path) {
+		return "secret_like_file"
+	}
+	for _, pattern := range secretLikeContentPatterns {
+		if pattern.regex.MatchString(content) {
+			return pattern.reason
+		}
+	}
+	return ""
+}
+
+func redactSecretLikeContent(content string) (string, bool) {
+	redacted := content
+	changed := false
+	for _, pattern := range secretRedactionPatterns {
+		next := pattern.regex.ReplaceAllString(redacted, pattern.replacement)
+		if next != redacted {
+			changed = true
+			redacted = next
+		}
+	}
+	return redacted, changed
+}
+
+func detectFileMimeType(path, fallback string) string {
+	if strings.EqualFold(filepath.Base(path), "Dockerfile") {
+		return "text/x-dockerfile"
+	}
+	if ext := filepath.Ext(path); ext != "" {
+		if byExt := mime.TypeByExtension(ext); byExt != "" {
+			return byExt
+		}
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return "text/plain; charset=utf-8"
+}
+
+func detectFenceLanguage(path string) string {
+	if strings.EqualFold(filepath.Base(path), "Dockerfile") {
+		return "dockerfile"
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".py":
+		return "py"
+	case ".ts":
+		return "ts"
+	case ".tsx":
+		return "tsx"
+	case ".js":
+		return "js"
+	case ".jsx":
+		return "jsx"
+	case ".json":
+		return "json"
+	case ".md":
+		return "md"
+	case ".yml", ".yaml":
+		return "yaml"
+	case ".toml":
+		return "toml"
+	case ".css":
+		return "css"
+	case ".html":
+		return "html"
+	case ".sh":
+		return "sh"
+	default:
+		return "text"
+	}
+}
+
+func trimTextByBytes(content string, maxBytes int) (string, bool) {
+	if maxBytes <= 0 || len(content) <= maxBytes {
+		return content, false
+	}
+	return content[:maxBytes], true
+}
+
+func optionalIntArg(args map[string]any, key string) int {
+	value, ok := args[key]
+	if !ok || value == nil {
+		return 0
+	}
+	switch v := value.(type) {
+	case int:
+		return v
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
+func sliceTextByLines(content string, startLine, endLine int) (string, int, int, bool) {
+	lines := strings.Split(content, "\n")
+	if startLine < 1 {
+		startLine = 1
+	}
+	if endLine < startLine || endLine == 0 {
+		endLine = len(lines)
+	}
+	if startLine > len(lines) {
+		return "", startLine, startLine, true
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+	return strings.Join(lines[startLine-1:endLine], "\n"), startLine, endLine, endLine < len(lines)
+}
+
+func newInlineFileToolResult(owner, repo, filePath, ref, sha, mimeType, content string, startLine, endLine int, truncated bool) *mcp.CallToolResult {
+	structured := map[string]any{
+		"owner":      owner,
+		"repo":       repo,
+		"path":       filePath,
+		"ref":        ref,
+		"sha":        sha,
+		"mime_type":  mimeType,
+		"encoding":   "utf-8",
+		"truncated":  truncated,
+		"start_line": startLine,
+		"end_line":   endLine,
+		"content":    content,
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{
+				Text: fmt.Sprintf("File: %s\nRepo: %s/%s\nRef: %s\nSHA: %s\n\n```%s\n%s\n```",
+					filePath,
+					owner,
+					repo,
+					ref,
+					sha,
+					detectFenceLanguage(filePath),
+					content,
+				),
 			},
 		},
-		Required: []string{"owner", "repo"},
+		StructuredContent: structured,
 	}
-	if includeFields {
-		schema.Properties["fields"] = fieldsSchemaProperty(
-			"Subset of fields to return for each entry when the path is a directory. If omitted, all fields are returned. Ignored when the path is a single file. Use this to reduce response size when listing directories and you only need specific fields, e.g. just 'name' and 'type'.",
-			fileContentFieldEnum,
-		)
-	}
+}
 
-	return NewTool(
+func newBlockedFileToolResult(path, reason string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: fmt.Sprintf(`{"blocked":true,"reason":"%s","path":"%s"}`, reason, path)},
+		},
+		StructuredContent: map[string]any{
+			"blocked": true,
+			"reason":  reason,
+			"path":    path,
+		},
+		IsError: true,
+	}
+}
+
+func newBinaryMetadataToolResult(owner, repo, filePath, ref, sha, mimeType string, size int) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{
+				Text: fmt.Sprintf("Binary file not inlined.\nPath: %s\nRepo: %s/%s\nRef: %s\nSHA: %s\nMIME: %s\nSize: %d",
+					filePath, owner, repo, ref, sha, mimeType, size),
+			},
+		},
+		StructuredContent: map[string]any{
+			"owner":      owner,
+			"repo":       repo,
+			"path":       filePath,
+			"ref":        ref,
+			"sha":        sha,
+			"mime_type":  mimeType,
+			"encoding":   "binary",
+			"size":       size,
+			"truncated":  true,
+			"start_line": 0,
+			"end_line":   0,
+			"content":    "",
+			"blocked":    true,
+			"reason":     "binary_file",
+		},
+	}
+}
+
+// GetFileContents creates a tool to get the contents of a file or directory from a GitHub repository.
+func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "get_file_contents",
@@ -822,7 +2326,49 @@ func getFileContentsTool(t translations.TranslationHelperFunc, includeFields boo
 				Title:        t("TOOL_GET_FILE_CONTENTS_USER_TITLE", "Get file or directory contents"),
 				ReadOnlyHint: true,
 			},
-			InputSchema: schema,
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (username or organization)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"path": {
+						Type:        "string",
+						Description: "Path to file/directory",
+						Default:     json.RawMessage(`"/"`),
+					},
+					"ref": {
+						Type:        "string",
+						Description: "Accepts optional git refs such as `refs/tags/{tag}`, `refs/heads/{branch}` or `refs/pull/{pr_number}/head`",
+					},
+					"sha": {
+						Type:        "string",
+						Description: "Accepts optional commit SHA. If specified, it will be used instead of ref",
+					},
+					"start_line": {
+						Type:        "integer",
+						Description: "Optional start line for text file reads",
+					},
+					"end_line": {
+						Type:        "integer",
+						Description: "Optional end line for text file reads",
+					},
+					"max_bytes": {
+						Type:        "integer",
+						Description: "Optional maximum UTF-8 bytes to return for text file reads",
+					},
+					"fields": fieldsSchemaProperty(
+						"Subset of fields to return for directory entries.",
+						fileContentFieldEnum,
+					),
+				},
+				Required: []string{"owner", "repo"},
+			},
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
@@ -840,6 +2386,9 @@ func getFileContentsTool(t translations.TranslationHelperFunc, includeFields boo
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			path = strings.TrimPrefix(path, "/")
+			if isSecretLikeRepoPath(path) {
+				return newBlockedFileToolResult(path, "secret_like_file"), nil, nil
+			}
 
 			ref, err := OptionalParam[string](args, "ref")
 			if err != nil {
@@ -850,14 +2399,6 @@ func getFileContentsTool(t translations.TranslationHelperFunc, includeFields boo
 			sha, err := OptionalParam[string](args, "sha")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
-			}
-
-			var fields []string
-			if includeFields {
-				fields, err = OptionalStringArrayParam(args, "fields")
-				if err != nil {
-					return utils.NewToolResultError(err.Error()), nil, nil
-				}
 			}
 
 			client, err := deps.GetClient(ctx)
@@ -878,6 +2419,9 @@ func getFileContentsTool(t translations.TranslationHelperFunc, includeFields boo
 			if err != nil {
 				return utils.NewToolResultError(fmt.Sprintf("failed to resolve git reference: %s", err)), nil, nil
 			}
+			startLine := optionalIntArg(args, "start_line")
+			endLine := optionalIntArg(args, "end_line")
+			maxBytes := optionalIntArg(args, "max_bytes")
 
 			if rawOpts.SHA != "" {
 				ref = rawOpts.SHA
@@ -887,10 +2431,19 @@ func getFileContentsTool(t translations.TranslationHelperFunc, includeFields boo
 			opts := &github.RepositoryContentGetOptions{Ref: ref}
 
 			// Always call GitHub Contents API first to get metadata including SHA and determine if it's a file or directory
-			fileContent, dirContent, respContents, err := client.Repositories.GetContents(ctx, owner, repo, path, opts)
+			type contentsResult struct {
+				fileContent *github.RepositoryContent
+				dirContent  []*github.RepositoryContent
+			}
+			contents, respContents, err := retryGitHubCall(ctx, deps, "get_file_contents:GetContents", func(callCtx context.Context) (contentsResult, *github.Response, error) {
+				fileContent, dirContent, respContents, err := client.Repositories.GetContents(callCtx, owner, repo, path, opts)
+				return contentsResult{fileContent: fileContent, dirContent: dirContent}, respContents, err
+			})
 			if respContents != nil {
 				defer func() { _ = respContents.Body.Close() }()
 			}
+			fileContent := contents.fileContent
+			dirContent := contents.dirContent
 
 			// The path does not point to a file or directory.
 			// Instead let's try to find it in the Git Tree by matching the end of the path.
@@ -902,103 +2455,106 @@ func getFileContentsTool(t translations.TranslationHelperFunc, includeFields boo
 			if fileContent != nil && fileContent.SHA != nil {
 				fileSHA = *fileContent.SHA
 				fileSize := fileContent.GetSize()
-				// Build resource URI for the file using URI templates
-				pathParts := strings.Split(path, "/")
-				resourceURI, err := expandRepoResourceURI(owner, repo, sha, ref, pathParts)
-				if err != nil {
-					return utils.NewToolResultError("failed to build resource URI"), nil, nil
-				}
 
 				// main branch ref passed in ref parameter but it doesn't exist - default branch was used
 				var successNote string
 				if fallbackUsed {
 					successNote = fmt.Sprintf(" Note: the provided ref '%s' does not exist, default branch '%s' was used instead.", originalRef, rawOpts.Ref)
 				}
-
-				// Empty files (0 bytes) have no content to decode; return
-				// them directly as empty text to avoid errors from
-				// GetContent when the API returns null content with a
-				// base64 encoding field, and to avoid DetectContentType
-				// misclassifying them as binary.
 				if fileSize == 0 {
-					result := &mcp.ResourceContents{
-						URI:      resourceURI,
-						Text:     "",
-						MIMEType: "text/plain",
+					result := newInlineFileToolResult(owner, repo, path, rawOpts.Ref, fileSHA, "text/plain", "", 1, 1, false)
+					if successNote != "" {
+						text := result.Content[0].(*mcp.TextContent)
+						text.Text = strings.Replace(text.Text, "\n\n```", fmt.Sprintf("%s\n\n```", successNote), 1)
 					}
-					return attachIFC(utils.NewToolResultResource(fmt.Sprintf("successfully downloaded empty file (SHA: %s)%s", fileSHA, successNote), result)), nil, nil
+					return attachIFC(result), nil, nil
 				}
 
-				// For files >= 1MB, return a ResourceLink instead of content
+				var contentBytes []byte
+				var contentType string
 				const maxContentSize = 1024 * 1024 // 1MB
-				if fileSize >= maxContentSize {
-					size := int64(fileSize)
-					resourceLink := &mcp.ResourceLink{
-						URI:   resourceURI,
-						Name:  fileContent.GetName(),
-						Title: fmt.Sprintf("File: %s", path),
-						Size:  &size,
+				useRaw := fileSize >= maxContentSize
+				if !useRaw {
+					content, decodeErr := fileContent.GetContent()
+					if decodeErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to decode file content: %s", decodeErr)), nil, nil
 					}
-					return attachIFC(utils.NewToolResultResourceLink(
-						fmt.Sprintf("File %s is too large to display (%d bytes). Use the download URL to fetch the content: %s (SHA: %s)%s",
-							path, fileSize, fileContent.GetDownloadURL(), fileSHA, successNote),
-						resourceLink)), nil, nil
+					contentBytes = []byte(content)
+					contentType = detectFileMimeType(path, http.DetectContentType(contentBytes))
+				} else {
+					rawClient, rawErr := deps.GetRawClient(ctx)
+					if rawErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to get GitHub raw content client: %s", rawErr)), nil, nil
+					}
+					rawResp, rawErr := retryGitHubHTTPCall(ctx, deps, "get_file_contents:GetRawContent", func(callCtx context.Context) (*http.Response, error) {
+						return rawClient.GetRawContent(callCtx, owner, repo, path, rawOpts)
+					})
+					if rawErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to fetch raw file content: %s", rawErr)), nil, nil
+					}
+					defer func() { _ = rawResp.Body.Close() }()
+					if rawResp.StatusCode != http.StatusOK {
+						body, readErr := io.ReadAll(rawResp.Body)
+						if readErr == nil {
+							_ = body
+						}
+						return attachIFC(newBinaryMetadataToolResult(owner, repo, path, rawOpts.Ref, fileSHA, detectFileMimeType(path, "application/octet-stream"), fileSize)), nil, nil
+					}
+					contentBytes, err = io.ReadAll(rawResp.Body)
+					if err != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to read file content: %s", err)), nil, nil
+					}
+					contentType = detectFileMimeType(path, rawResp.Header.Get("Content-Type"))
 				}
-
-				// For files < 1MB, get content directly from Contents API
-				content, err := fileContent.GetContent()
-				if err != nil {
-					return utils.NewToolResultError(fmt.Sprintf("failed to decode file content: %s", err)), nil, nil
-				}
-
-				// Detect content type from the actual content bytes,
-				// mirroring the original approach of using the Content-Type header
-				// from the raw API response.
-				contentBytes := []byte(content)
-				contentType := http.DetectContentType(contentBytes)
-
-				// Determine if content is text or binary based on detected content type
 				isTextContent := strings.HasPrefix(contentType, "text/") ||
 					contentType == "application/json" ||
 					contentType == "application/xml" ||
 					strings.HasSuffix(contentType, "+json") ||
 					strings.HasSuffix(contentType, "+xml")
+				if !isTextContent {
+					msg := fmt.Sprintf("Binary file not inlined (SHA: %s)%s", fileSHA, successNote)
+					return attachIFC(newBinaryMetadataToolResult(owner, repo, path, rawOpts.Ref, fileSHA, contentType, fileSize)), map[string]any{"message": msg}, nil
+				}
 
-				if isTextContent {
-					result := &mcp.ResourceContents{
-						URI:      resourceURI,
-						Text:     content,
-						MIMEType: contentType,
+				content := string(contentBytes)
+				if startLine > 0 || endLine > 0 {
+					var truncated bool
+					content, startLine, endLine, truncated = sliceTextByLines(content, startLine, endLine)
+					content, redacted := redactSecretLikeContent(content)
+					result := newInlineFileToolResult(owner, repo, path, rawOpts.Ref, fileSHA, contentType, content, startLine, endLine, truncated)
+					if redacted {
+						if structured, ok := result.StructuredContent.(map[string]any); ok {
+							structured["redacted"] = true
+						}
 					}
-					return attachIFC(utils.NewToolResultResource(fmt.Sprintf("successfully downloaded text file (SHA: %s)%s", fileSHA, successNote), result)), nil, nil
+					if successNote != "" {
+						text := result.Content[0].(*mcp.TextContent)
+						text.Text = strings.Replace(text.Text, "\n\n```", fmt.Sprintf("%s\n\n```", successNote), 1)
+					}
+					return attachIFC(result), nil, nil
 				}
 
-				// Binary content - encode as base64 blob
-				blobContent := base64.StdEncoding.EncodeToString(contentBytes)
-				result := &mcp.ResourceContents{
-					URI:      resourceURI,
-					Blob:     []byte(blobContent),
-					MIMEType: contentType,
+				if maxBytes == 0 {
+					maxBytes = 128 * 1024
 				}
-				return attachIFC(utils.NewToolResultResource(fmt.Sprintf("successfully downloaded binary file (SHA: %s)%s", fileSHA, successNote), result)), nil, nil
+				content, truncated := trimTextByBytes(content, maxBytes)
+				content, redacted := redactSecretLikeContent(content)
+				result := newInlineFileToolResult(owner, repo, path, rawOpts.Ref, fileSHA, contentType, content, 1, strings.Count(content, "\n")+1, truncated)
+				if redacted {
+					if structured, ok := result.StructuredContent.(map[string]any); ok {
+						structured["redacted"] = true
+					}
+				}
+				if successNote != "" {
+					text := result.Content[0].(*mcp.TextContent)
+					text.Text = strings.Replace(text.Text, "\n\n```", fmt.Sprintf("%s\n\n```", successNote), 1)
+				}
+				return attachIFC(result), nil, nil
 			} else if dirContent != nil {
 				// file content or file SHA is nil which means it's a directory
-				filtered := false
-				var payload any = dirContent
-				if includeFields && len(fields) > 0 {
-					filteredEntries, err := filterEachField(dirContent, fields)
-					if err != nil {
-						return utils.NewToolResultErrorFromErr("failed to filter directory contents", err), nil, nil
-					}
-					payload = filteredEntries
-					filtered = true
-				}
-				r, err := json.Marshal(payload)
+				r, err := json.Marshal(dirContent)
 				if err != nil {
 					return utils.NewToolResultError("failed to marshal response"), nil, nil
-				}
-				if includeFields {
-					recordDirContentsFieldsUsage(ctx, deps, dirContent, filtered, len(r))
 				}
 				return attachIFC(utils.NewToolResultText(string(r))), nil, nil
 			}
@@ -1006,12 +2562,19 @@ func getFileContentsTool(t translations.TranslationHelperFunc, includeFields boo
 			return utils.NewToolResultError("failed to get file contents"), nil, nil
 		},
 	)
+	st.FeatureFlagEnable = FeatureFlagFieldsParam
+	return st
 }
 
-// recordDirContentsFieldsUsage emits fields telemetry for a get_file_contents
-// directory listing. sentBytes is the size of the payload actually returned.
-func recordDirContentsFieldsUsage(ctx context.Context, deps ToolDependencies, full []*github.RepositoryContent, filtered bool, sentBytes int) {
-	recordFieldsUsageFor(ctx, deps, "get_file_contents", full, filtered, sentBytes)
+// LegacyGetFileContents is the feature-flag-disabled compatibility variant.
+func LegacyGetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := GetFileContents(t)
+	st.FeatureFlagEnable = ""
+	if schema, ok := st.Tool.InputSchema.(*jsonschema.Schema); ok {
+		delete(schema.Properties, "fields")
+	}
+	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
+	return st
 }
 
 // ForkRepository creates a tool to fork a repository.
@@ -1417,7 +2980,7 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "push_files",
-			Description: t("TOOL_PUSH_FILES_DESCRIPTION", "Push multiple files to a GitHub repository in a single commit"),
+			Description: t("TOOL_PUSH_FILES_DESCRIPTION", "Push multiple files to a GitHub repository in a single atomic commit. Each file supports replace, patch_text, patch_range, and unified_diff with expected_blob_sha and expected_occurrences; dry_run previews the complete multi-file patch and any failed expectation prevents a commit."),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_PUSH_FILES_USER_TITLE", "Push files to repository"),
 				ReadOnlyHint: false,
@@ -1452,13 +3015,26 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 									Type:        "string",
 									Description: "file content",
 								},
+								"operation":            {Type: "string", Enum: []any{"replace", "patch_text", "patch_range", "unified_diff"}},
+								"expected_blob_sha":    {Type: "string"},
+								"search":               {Type: "string"},
+								"replace":              {Type: "string"},
+								"expected_occurrences": {Type: "integer"},
+								"start_line":           {Type: "integer"},
+								"end_line":             {Type: "integer"},
+								"replacement":          {Type: "string"},
+								"patch":                {Type: "string"},
 							},
-							Required: []string{"path", "content"},
+							Required: []string{"path"},
 						},
 					},
 					"message": {
 						Type:        "string",
 						Description: "Commit message",
+					},
+					"dry_run": {
+						Type:        "boolean",
+						Description: "Validate the request and report what would happen without writing to GitHub",
 					},
 				},
 				Required: []string{"owner", "repo", "branch", "files", "message"},
@@ -1479,6 +3055,10 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			message, err := RequiredParam[string](args, "message")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			dryRun, err := OptionalParam[bool](args, "dry_run")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -1519,6 +3099,9 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 			// Only close resp if it's not nil and not an error case where resp might be nil
 			if resp != nil && resp.Body != nil {
 				defer func() { _ = resp.Body.Close() }()
+			}
+			if dryRun && (repositoryIsEmpty || branchNotFound) {
+				return MarshalledTextResult(map[string]any{"branch": branch, "changed_paths": []string{}, "file_count": len(filesObj), "patch_previews": []any{}, "dry_run": true, "branch_exists": false}), nil, nil
 			}
 
 			var baseCommit *github.Commit
@@ -1565,6 +3148,9 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 			// Create tree entries for all files (or remaining files if empty repo)
 			var entries []*github.TreeEntry
 
+			changedPaths := make([]string, 0, len(filesObj))
+			patchPreviews := make([]any, 0)
+			expectedAfter := make(map[string]string)
 			for _, file := range filesObj {
 				fileMap, ok := file.(map[string]any)
 				if !ok {
@@ -1576,9 +3162,57 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 					return utils.NewToolResultError("each file must have a path"), nil, nil
 				}
 
-				content, ok := fileMap["content"].(string)
-				if !ok {
+				content, hasContent := fileMap["content"].(string)
+				rawOperation, operationProvided := fileMap["operation"]
+				operation, _ := rawOperation.(string)
+				if operation == "" {
+					operation = "replace"
+				}
+				if !hasContent && operation == "replace" {
 					return utils.NewToolResultError("each file must have content"), nil, nil
+				}
+				expectedSHA, expectedBlobProvided := fileMap["expected_blob_sha"].(string)
+				if expectedSHA == "" {
+					expectedSHA, _ = fileMap["sha"].(string)
+				}
+				if operationProvided || expectedBlobProvided {
+					current, currentContent, currentResp, currentErr := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+					if currentResp != nil && currentResp.Body != nil {
+						_ = currentResp.Body.Close()
+					}
+					if currentErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("failed to fetch %s before patch: %v", path, currentErr)), nil, nil
+					}
+					if expectedSHA == "" {
+						return utils.NewToolResultError(fmt.Sprintf("expected_blob_sha is required for existing file %s", path)), nil, nil
+					}
+					if current.GetSHA() != expectedSHA {
+						return utils.NewToolResultError(fmt.Sprintf("SHA mismatch for %s: provided %s, current %s", path, expectedSHA, current.GetSHA())), nil, nil
+					}
+					occurrences, _ := optionalIntArgument(fileMap, "expected_occurrences")
+					startLine, _ := optionalIntArgument(fileMap, "start_line")
+					endLine, _ := optionalIntArgument(fileMap, "end_line")
+					search, _ := fileMap["search"].(string)
+					replace, _ := fileMap["replace"].(string)
+					replacement, _ := fileMap["replacement"].(string)
+					patchText, _ := fileMap["patch"].(string)
+					patchInput := filePatchInput{Operation: operation, Content: content, Search: search, Replace: replace, ExpectedOccurrences: occurrences, StartLine: startLine, EndLine: endLine, Replacement: replacement, Patch: patchText}
+					nextContent, patchPreview, patchErr := applyFilePatch(currentContent, patchInput)
+					if patchErr != nil {
+						return utils.NewToolResultError(fmt.Sprintf("%s: %v", path, patchErr)), nil, nil
+					}
+					if !unrelatedFileContentPreserved(currentContent, nextContent, patchInput) {
+						return utils.NewToolResultError(fmt.Sprintf("%s: unrelated content was not preserved", path)), nil, nil
+					}
+					content = nextContent
+					expectedAfter[path] = content
+					patchPreviews = append(patchPreviews, map[string]any{"path": path, "operation": operation, "expected_blob_sha": expectedSHA, "matched_occurrences": patchPreview.MatchedOccurrences, "hunks": patchPreview.Hunks, "before_preview": boundedRedactedPreview(currentContent), "after_preview": boundedRedactedPreview(nextContent)})
+				}
+				if isSecretLikeRepoPath(path) {
+					return newBlockedFileToolResult(path, "secret_like_file"), nil, nil
+				}
+				if reason := detectSecretLikeContent(path, content); reason != "" {
+					return newBlockedFileToolResult(path, reason), nil, nil
 				}
 
 				// Create a tree entry for the file
@@ -1588,6 +3222,16 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 					Type:    github.Ptr("blob"),
 					Content: github.Ptr(content),
 				})
+				changedPaths = append(changedPaths, path)
+			}
+
+			if dryRun {
+				return MarshalledTextResult(map[string]any{
+					"branch":         branch,
+					"changed_paths":  changedPaths,
+					"file_count":     len(changedPaths),
+					"patch_previews": patchPreviews,
+				}), nil, nil
 			}
 
 			// Create a new tree with the file entries (baseCommit is now guaranteed to exist)
@@ -1635,6 +3279,19 @@ func PushFiles(t translations.TranslationHelperFunc) inventory.ServerTool {
 				), nil, nil
 			}
 			defer func() { _ = resp.Body.Close() }()
+			mismatches := make([]any, 0)
+			for path, expected := range expectedAfter {
+				_, actual, verifyResp, verifyErr := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
+				if verifyResp != nil && verifyResp.Body != nil {
+					_ = verifyResp.Body.Close()
+				}
+				if verifyErr != nil || actual != expected {
+					mismatches = append(mismatches, map[string]any{"path": path, "requested": "exact_content", "actual": "mismatch"})
+				}
+			}
+			if len(mismatches) > 0 {
+				return utils.NewToolResultError("post-commit verification failed for one or more patched files"), nil, nil
+			}
 
 			r, err := json.Marshal(updatedRef)
 			if err != nil {
@@ -1850,57 +3507,9 @@ func GetTag(t translations.TranslationHelperFunc) inventory.ServerTool {
 	)
 }
 
-// ListReleases creates a tool to list releases in a GitHub repository. It is the
-// FeatureFlagFieldsParam-enabled variant: it advertises the optional `fields`
-// parameter and filters each release to the requested subset. Both this and
-// LegacyListReleases register under the tool name "list_releases"; exactly one is
-// active for any given request thanks to mutually exclusive FeatureFlagEnable /
-// FeatureFlagDisable annotations.
+// ListReleases creates a tool to list releases in a GitHub repository.
 func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
-	st := listReleasesTool(t, true)
-	st.FeatureFlagEnable = FeatureFlagFieldsParam
-	return st
-}
-
-// LegacyListReleases is the FeatureFlagFieldsParam-disabled variant of
-// list_releases. It exposes the original schema (no `fields` parameter) and never
-// filters results, so it acts as the kill switch when the flag is off. It owns
-// the canonical list_releases.snap; the flag-enabled variant owns
-// list_releases_ff_<flag>.snap. Delete this function when the flag is removed.
-func LegacyListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
-	st := listReleasesTool(t, false)
-	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
-	return st
-}
-
-// listReleasesTool builds the list_releases tool. When includeFields is true the
-// tool advertises the optional `fields` parameter, filters each release to the
-// requested subset, and emits fields telemetry. When false it is the original
-// tool with no fields parameter and no filtering.
-func listReleasesTool(t translations.TranslationHelperFunc, includeFields bool) inventory.ServerTool {
-	schema := &jsonschema.Schema{
-		Type: "object",
-		Properties: map[string]*jsonschema.Schema{
-			"owner": {
-				Type:        "string",
-				Description: "Repository owner",
-			},
-			"repo": {
-				Type:        "string",
-				Description: "Repository name",
-			},
-		},
-		Required: []string{"owner", "repo"},
-	}
-	if includeFields {
-		schema.Properties["fields"] = fieldsSchemaProperty(
-			"Subset of fields to return for each release. If omitted, all fields are returned. Use this to reduce response size when you only need specific fields; omitting 'body' in particular drops the largest per-release data.",
-			listReleasesItemFieldEnum,
-		)
-	}
-	WithPagination(schema)
-
-	return NewTool(
+	st := NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "list_releases",
@@ -1909,7 +3518,24 @@ func listReleasesTool(t translations.TranslationHelperFunc, includeFields bool) 
 				Title:        t("TOOL_LIST_RELEASES_USER_TITLE", "List releases"),
 				ReadOnlyHint: true,
 			},
-			InputSchema: schema,
+			InputSchema: WithPagination(&jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"fields": fieldsSchemaProperty(
+						"Subset of fields to return for each release.",
+						listReleasesItemFieldEnum,
+					),
+				},
+				Required: []string{"owner", "repo"},
+			}),
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
@@ -1921,14 +3547,11 @@ func listReleasesTool(t translations.TranslationHelperFunc, includeFields bool) 
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			var fields []string
-			if includeFields {
-				fields, err = OptionalStringArrayParam(args, "fields")
-				if err != nil {
-					return utils.NewToolResultError(err.Error()), nil, nil
-				}
-			}
 			pagination, err := OptionalPaginationParams(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			fields, err := OptionalStringArrayParam(args, "fields")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -1966,24 +3589,19 @@ func listReleasesTool(t translations.TranslationHelperFunc, includeFields bool) 
 
 			filtered := false
 			var payload any = minimalReleases
-			if includeFields && len(fields) > 0 {
-				filteredReleases, err := filterEachField(minimalReleases, fields)
+			if len(fields) > 0 {
+				payload, err = filterEachField(minimalReleases, fields)
 				if err != nil {
 					return utils.NewToolResultErrorFromErr("failed to filter releases", err), nil, nil
 				}
-				payload = filteredReleases
 				filtered = true
 			}
-
 			r, err := json.Marshal(payload)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			if includeFields {
-				recordFieldsUsageFor(ctx, deps, "list_releases", minimalReleases, filtered, len(r))
-			}
-
+			recordFieldsUsageFor(ctx, deps, "list_releases", minimalReleases, filtered, len(r))
 			result := utils.NewToolResultText(string(r))
 			// Releases are published by collaborators with push access, so
 			// integrity is trusted. Confidentiality follows repo visibility,
@@ -2004,6 +3622,19 @@ func listReleasesTool(t translations.TranslationHelperFunc, includeFields bool) 
 			return result, nil, nil
 		},
 	)
+	st.FeatureFlagEnable = FeatureFlagFieldsParam
+	return st
+}
+
+// LegacyListReleases is the feature-flag-disabled schema variant.
+func LegacyListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := ListReleases(t)
+	st.FeatureFlagEnable = ""
+	if schema, ok := st.Tool.InputSchema.(*jsonschema.Schema); ok {
+		delete(schema.Properties, "fields")
+	}
+	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
+	return st
 }
 
 // GetLatestRelease creates a tool to get the latest release in a GitHub repository.
@@ -2297,10 +3928,9 @@ func ListStarredRepositories(t translations.TranslationHelperFunc) inventory.Ser
 			result := utils.NewToolResultText(string(r))
 			// A starred-repository listing exposes repository data across many
 			// repos; reuse the multi-repo join shared with search_repositories
-			// (public-only results stay public-untrusted, mixed-visibility
-			// results become private-untrusted, all-private results become
-			// private-trusted). Visibility is read directly from the response,
-			// so no extra API call is needed.
+			// (untrusted integrity; confidentiality private if any matched repo
+			// is private). Visibility is read directly from the response, so no
+			// extra API call is needed.
 			visibilities := make([]bool, 0, len(minimalRepos))
 			for _, mr := range minimalRepos {
 				visibilities = append(visibilities, mr.Private)

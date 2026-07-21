@@ -48,6 +48,7 @@ const (
 	GetReposGitRefByOwnerByRepoByRef           = "GET /repos/{owner}/{repo}/git/ref/{ref:.*}"
 	PostReposGitRefsByOwnerByRepo              = "POST /repos/{owner}/{repo}/git/refs"
 	PatchReposGitRefsByOwnerByRepoByRef        = "PATCH /repos/{owner}/{repo}/git/refs/{ref:.*}"
+	DeleteReposGitRefsByOwnerByRepoByRef       = "DELETE /repos/{owner}/{repo}/git/refs/{ref:.*}"
 	GetReposGitCommitsByOwnerByRepoByCommitSHA = "GET /repos/{owner}/{repo}/git/commits/{commit_sha}"
 	PostReposGitCommitsByOwnerByRepo           = "POST /repos/{owner}/{repo}/git/commits"
 	GetReposGitTagsByOwnerByRepoByTagSHA       = "GET /repos/{owner}/{repo}/git/tags/{tag_sha}"

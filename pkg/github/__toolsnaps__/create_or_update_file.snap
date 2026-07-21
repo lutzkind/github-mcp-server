@@ -4,7 +4,7 @@
     "readOnlyHint": false,
     "title": "Create or update file"
   },
-  "description": "Create or update a single file in a GitHub repository. \nIf updating, you should provide the SHA of the file you want to update. Use this tool to create or update a file in a GitHub repository remotely; do not use it for local file operations.\n\nIn order to obtain the SHA of original file version before updating, use the following git command:\ngit rev-parse \u003cbranch\u003e:\u003cpath to file\u003e\n\nSHA MUST be provided for existing file updates.\n",
+  "description": "Create or update a single file in a GitHub repository. Supports guarded patch_text, patch_range, and unified_diff operations with expected_blob_sha, expected_occurrences, dry_run preview, and exact content-preservation checks.\nIf updating, you should provide the SHA of the file you want to update. Use this tool to create or update a file in a GitHub repository remotely; do not use it for local file operations.\n\nIn order to obtain the SHA of original file version before updating, use the following git command:\ngit rev-parse \u003cbranch\u003e:\u003cpath to file\u003e\n\nSHA MUST be provided for existing file updates.\n",
   "inputSchema": {
     "properties": {
       "branch": {
@@ -15,32 +15,77 @@
         "description": "Content of the file",
         "type": "string"
       },
+      "dry_run": {
+        "description": "Validate the request and report what would happen without writing to GitHub",
+        "type": "boolean"
+      },
+      "end_line": {
+        "description": "One-based inclusive end line for patch_range.",
+        "type": "integer"
+      },
+      "expected_blob_sha": {
+        "description": "Current Git blob SHA. Required when modifying an existing file.",
+        "type": "string"
+      },
+      "expected_occurrences": {
+        "description": "Exact number of search matches required.",
+        "type": "integer"
+      },
       "message": {
         "description": "Commit message",
+        "type": "string"
+      },
+      "operation": {
+        "description": "Mutation mode. Omitting this keeps the legacy replace behavior.",
+        "enum": [
+          "replace",
+          "patch_text",
+          "patch_range",
+          "unified_diff"
+        ],
         "type": "string"
       },
       "owner": {
         "description": "Repository owner (username or organization)",
         "type": "string"
       },
+      "patch": {
+        "description": "Single-file unified diff for unified_diff.",
+        "type": "string"
+      },
       "path": {
         "description": "Path where to create/update the file",
+        "type": "string"
+      },
+      "replace": {
+        "description": "Replacement text for patch_text.",
+        "type": "string"
+      },
+      "replacement": {
+        "description": "Replacement text for patch_range.",
         "type": "string"
       },
       "repo": {
         "description": "Repository name",
         "type": "string"
       },
+      "search": {
+        "description": "Exact text to find for patch_text.",
+        "type": "string"
+      },
       "sha": {
         "description": "The blob SHA of the file being replaced. Required if the file already exists.",
         "type": "string"
+      },
+      "start_line": {
+        "description": "One-based inclusive start line for patch_range.",
+        "type": "integer"
       }
     },
     "required": [
       "owner",
       "repo",
       "path",
-      "content",
       "message",
       "branch"
     ],

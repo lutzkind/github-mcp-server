@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,11 +29,7 @@ func Test_GetFileContents(t *testing.T) {
 	// Verify tool definition once
 	serverTool := GetFileContents(translations.NullTranslationHelper)
 	tool := serverTool.Tool
-	// GetFileContents is the FeatureFlagFieldsParam-enabled variant; it owns the
-	// _ff_<flag> snapshot. The canonical get_file_contents.snap is owned by
-	// LegacyGetFileContents (see Test_LegacyGetFileContents_Definition).
-	require.NoError(t, toolsnaps.Test(tool.Name+"_ff_"+FeatureFlagFieldsParam, tool))
-	require.Equal(t, FeatureFlagFieldsParam, serverTool.FeatureFlagEnable)
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
 
 	schema, ok := tool.InputSchema.(*jsonschema.Schema)
 	require.True(t, ok, "InputSchema should be *jsonschema.Schema")
@@ -43,7 +41,9 @@ func Test_GetFileContents(t *testing.T) {
 	assert.Contains(t, schema.Properties, "path")
 	assert.Contains(t, schema.Properties, "ref")
 	assert.Contains(t, schema.Properties, "sha")
-	assert.Contains(t, schema.Properties, "fields")
+	assert.Contains(t, schema.Properties, "start_line")
+	assert.Contains(t, schema.Properties, "end_line")
+	assert.Contains(t, schema.Properties, "max_bytes")
 	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo"})
 
 	// Mock response for raw content
@@ -110,7 +110,7 @@ func Test_GetFileContents(t *testing.T) {
 			expectedResult: mcp.ResourceContents{
 				URI:      "repo://owner/repo/refs/heads/main/contents/README.md",
 				Text:     "# Test Repository\n\nThis is a test repository.",
-				MIMEType: "text/plain; charset=utf-8",
+				MIMEType: "text/markdown; charset=utf-8",
 			},
 		},
 		{
@@ -237,7 +237,7 @@ func Test_GetFileContents(t *testing.T) {
 			expectedResult: mcp.ResourceContents{
 				URI:      "repo://owner/repo/refs/heads/main/contents/README.md",
 				Text:     "# Test Repository\n\nThis is a test repository.",
-				MIMEType: "text/plain; charset=utf-8",
+				MIMEType: "text/markdown; charset=utf-8",
 			},
 		},
 		{
@@ -321,7 +321,7 @@ func Test_GetFileContents(t *testing.T) {
 			expectedResult: mcp.ResourceContents{
 				URI:      "repo://owner/repo/sha/abc123def456abc123def456abc123def456abc1/contents/README.md",
 				Text:     "# Test Repository\n\nThis is a test repository.",
-				MIMEType: "text/plain; charset=utf-8",
+				MIMEType: "text/markdown; charset=utf-8",
 			},
 			expectedMsg: " Note: the provided ref 'main' does not exist, default branch 'refs/heads/develop' was used instead.",
 		},
@@ -344,6 +344,11 @@ func Test_GetFileContents(t *testing.T) {
 					contentBytes, _ := json.Marshal(fileContent)
 					_, _ = w.Write(contentBytes)
 				},
+				GetRawReposContentsByOwnerByRepoByPath: func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/octet-stream")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte{0x01, 0x02, 0x03})
+				},
 			}),
 			requestArgs: map[string]any{
 				"owner": "owner",
@@ -352,10 +357,9 @@ func Test_GetFileContents(t *testing.T) {
 				"ref":   "refs/heads/main",
 			},
 			expectError: false,
-			expectedResult: &mcp.ResourceLink{
-				URI:   "repo://owner/repo/refs/heads/main/contents/large-file.bin",
-				Name:  "large-file.bin",
-				Title: "File: large-file.bin",
+			expectedResult: mcp.ResourceContents{
+				MIMEType: "application/octet-stream",
+				Blob:     []byte("non-empty"),
 			},
 		},
 		{
@@ -390,7 +394,6 @@ func Test_GetFileContents(t *testing.T) {
 				Text:     "",
 				MIMEType: "text/plain",
 			},
-			expectedMsg: "successfully downloaded empty file",
 		},
 		{
 			name: "content fetch fails",
@@ -446,16 +449,23 @@ func Test_GetFileContents(t *testing.T) {
 			// Use the correct result helper based on the expected type
 			switch expected := tc.expectedResult.(type) {
 			case mcp.ResourceContents:
-				// Handle both text and blob resources
-				resource := getResourceResult(t, result)
-				assert.Equal(t, expected, *resource)
-
-				// If expectedMsg is set, verify the message text
-				if tc.expectedMsg != "" {
-					require.Len(t, result.Content, 2)
-					textContent, ok := result.Content[0].(*mcp.TextContent)
-					require.True(t, ok, "expected Content[0] to be TextContent")
-					assert.Contains(t, textContent.Text, tc.expectedMsg)
+				if expected.Blob == nil {
+					textContent := getTextResult(t, result)
+					assert.Contains(t, textContent.Text, expected.Text)
+					sc, ok := result.StructuredContent.(map[string]any)
+					require.True(t, ok, "expected structured content for text file")
+					assert.Equal(t, expected.Text, sc["content"])
+					assert.Equal(t, expected.MIMEType, sc["mime_type"])
+					if tc.expectedMsg != "" {
+						assert.Contains(t, textContent.Text, tc.expectedMsg)
+					}
+				} else {
+					textContent := getTextResult(t, result)
+					assert.Contains(t, textContent.Text, "Binary file not inlined")
+					sc, ok := result.StructuredContent.(map[string]any)
+					require.True(t, ok, "expected structured content for binary file")
+					assert.Equal(t, expected.MIMEType, sc["mime_type"])
+					assert.Equal(t, true, sc["blocked"])
 				}
 			case []*github.RepositoryContent:
 				// Directory content fetch returns a text result (JSON array)
@@ -469,148 +479,12 @@ func Test_GetFileContents(t *testing.T) {
 					assert.Equal(t, *expected[i].Path, *content.Path)
 					assert.Equal(t, *expected[i].Type, *content.Type)
 				}
-			case *mcp.ResourceLink:
-				// Large file returns a ResourceLink
-				require.Len(t, result.Content, 2)
-				resourceLink, ok := result.Content[1].(*mcp.ResourceLink)
-				require.True(t, ok, "expected Content[1] to be ResourceLink")
-				assert.Equal(t, expected.URI, resourceLink.URI)
-				assert.Equal(t, expected.Name, resourceLink.Name)
-				assert.Equal(t, expected.Title, resourceLink.Title)
 			case mcp.TextContent:
 				textContent := getErrorResult(t, result)
 				require.Equal(t, textContent, expected)
 			}
 		})
 	}
-}
-
-func Test_GetFileContents_DirectoryFieldFiltering(t *testing.T) {
-	mockDirContent := []*github.RepositoryContent{
-		{
-			Type:        github.Ptr("file"),
-			Name:        github.Ptr("README.md"),
-			Path:        github.Ptr("README.md"),
-			SHA:         github.Ptr("abc123"),
-			Size:        github.Ptr(42),
-			URL:         github.Ptr("https://api.github.com/repos/owner/repo/contents/README.md"),
-			HTMLURL:     github.Ptr("https://github.com/owner/repo/blob/main/README.md"),
-			DownloadURL: github.Ptr("https://raw.githubusercontent.com/owner/repo/main/README.md"),
-		},
-		{
-			Type:    github.Ptr("dir"),
-			Name:    github.Ptr("src"),
-			Path:    github.Ptr("src"),
-			SHA:     github.Ptr("def456"),
-			HTMLURL: github.Ptr("https://github.com/owner/repo/tree/main/src"),
-		},
-	}
-
-	serverTool := GetFileContents(translations.NullTranslationHelper)
-	client := mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
-		GetReposByOwnerByRepo:            mockResponse(t, http.StatusOK, "{\"name\": \"repo\", \"default_branch\": \"main\"}"),
-		GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, "{\"ref\": \"refs/heads/main\", \"object\": {\"sha\": \"\"}}"),
-		GetReposContentsByOwnerByRepoByPath: expectQueryParams(t, map[string]string{}).andThen(
-			mockResponse(t, http.StatusOK, mockDirContent),
-		),
-		GetRawReposContentsByOwnerByRepoByPath: expectQueryParams(t, map[string]string{"branch": "main"}).andThen(
-			mockResponse(t, http.StatusNotFound, nil),
-		),
-	}))
-	deps := BaseDeps{Client: client}
-	handler := serverTool.Handler(deps)
-
-	request := createMCPRequest(map[string]any{
-		"owner":  "owner",
-		"repo":   "repo",
-		"path":   "src/",
-		"fields": []any{"name", "type"},
-	})
-
-	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
-	require.NoError(t, err)
-	require.False(t, result.IsError)
-
-	textContent := getTextResult(t, result)
-
-	// Each directory entry is reduced to the requested fields only; heavier
-	// fields such as html_url and download_url are dropped.
-	var returned []map[string]any
-	require.NoError(t, json.Unmarshal([]byte(textContent.Text), &returned))
-	require.Len(t, returned, len(mockDirContent))
-	for _, entry := range returned {
-		require.Len(t, entry, 2)
-		assert.Contains(t, entry, "name")
-		assert.Contains(t, entry, "type")
-	}
-
-	assert.NotContains(t, textContent.Text, "html_url")
-	assert.NotContains(t, textContent.Text, "download_url")
-}
-
-func Test_LegacyGetFileContents_Definition(t *testing.T) {
-	serverTool := LegacyGetFileContents(translations.NullTranslationHelper)
-	tool := serverTool.Tool
-	// LegacyGetFileContents is the FeatureFlagFieldsParam-disabled variant and
-	// owns the canonical get_file_contents.snap (no `fields`).
-	require.NoError(t, toolsnaps.Test(tool.Name, tool))
-	require.Equal(t, []string{FeatureFlagFieldsParam}, serverTool.FeatureFlagDisable)
-
-	assert.Equal(t, "get_file_contents", tool.Name)
-	schema, ok := tool.InputSchema.(*jsonschema.Schema)
-	require.True(t, ok, "InputSchema should be *jsonschema.Schema")
-	assert.NotContains(t, schema.Properties, "fields")
-}
-
-func Test_GetFileContents_DirectoryFieldsTelemetry(t *testing.T) {
-	mockDirContent := []*github.RepositoryContent{
-		{
-			Type:        github.Ptr("file"),
-			Name:        github.Ptr("README.md"),
-			Path:        github.Ptr("README.md"),
-			SHA:         github.Ptr("abc123"),
-			Size:        github.Ptr(42),
-			URL:         github.Ptr("https://api.github.com/repos/owner/repo/contents/README.md"),
-			HTMLURL:     github.Ptr("https://github.com/owner/repo/blob/main/README.md"),
-			DownloadURL: github.Ptr("https://raw.githubusercontent.com/owner/repo/main/README.md"),
-		},
-	}
-
-	serverTool := GetFileContents(translations.NullTranslationHelper)
-	client := mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
-		GetReposByOwnerByRepo:            mockResponse(t, http.StatusOK, "{\"name\": \"repo\", \"default_branch\": \"main\"}"),
-		GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, "{\"ref\": \"refs/heads/main\", \"object\": {\"sha\": \"\"}}"),
-		GetReposContentsByOwnerByRepoByPath: expectQueryParams(t, map[string]string{}).andThen(
-			mockResponse(t, http.StatusOK, mockDirContent),
-		),
-		GetRawReposContentsByOwnerByRepoByPath: expectQueryParams(t, map[string]string{"branch": "main"}).andThen(
-			mockResponse(t, http.StatusNotFound, nil),
-		),
-	}))
-	deps, rec := depsWithRecordingMetrics(t, BaseDeps{Client: client})
-	handler := serverTool.Handler(deps)
-
-	request := createMCPRequest(map[string]any{
-		"owner":  "owner",
-		"repo":   "repo",
-		"path":   "src/",
-		"fields": []any{"name", "type"},
-	})
-
-	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
-	require.NoError(t, err)
-	require.False(t, result.IsError)
-
-	call, ok := rec.increment(metricFieldsToolCall)
-	require.True(t, ok)
-	assert.Equal(t, "get_file_contents", call.tags["tool"])
-	assert.Equal(t, "true", call.tags["filtered"])
-
-	full, ok := rec.counter(metricFieldsBytesFull)
-	require.True(t, ok)
-	sent, ok := rec.counter(metricFieldsBytesSent)
-	require.True(t, ok)
-	assert.Greater(t, full.value, sent.value, "filtering should remove bytes")
 }
 
 func Test_GetFileContents_IFC_InsidersMode(t *testing.T) {
@@ -753,6 +627,71 @@ func Test_GetFileContents_IFC_InsidersMode(t *testing.T) {
 			assert.False(t, hasIFC, "ifc label should be omitted when visibility lookup fails")
 		}
 	})
+}
+
+func Test_GetFileContents_BlocksSecretLikePaths(t *testing.T) {
+	serverTool := GetFileContents(translations.NullTranslationHelper)
+	client := mustNewGHClient(t, NewMockedHTTPClient())
+	deps := BaseDeps{Client: client}
+	handler := serverTool.Handler(deps)
+	request := createMCPRequest(map[string]any{
+		"owner": "owner",
+		"repo":  "repo",
+		"path":  ".env.production",
+	})
+
+	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	textContent := getErrorResult(t, result)
+	assert.Contains(t, textContent.Text, `"blocked":true`)
+	assert.Contains(t, textContent.Text, `"reason":"secret_like_file"`)
+}
+
+func Test_GetFileContents_LineRange(t *testing.T) {
+	serverTool := GetFileContents(translations.NullTranslationHelper)
+	content := []byte("one\ntwo\nthree\nfour\n")
+	client := mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+		GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, "{\"ref\": \"refs/heads/main\", \"object\": {\"sha\": \"\"}}"),
+		GetReposByOwnerByRepo:            mockResponse(t, http.StatusOK, "{\"name\": \"repo\", \"default_branch\": \"main\"}"),
+		GetReposContentsByOwnerByRepoByPath: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			encodedContent := base64.StdEncoding.EncodeToString(content)
+			fileContent := &github.RepositoryContent{
+				Name:     github.Ptr("README.md"),
+				Path:     github.Ptr("README.md"),
+				SHA:      github.Ptr("abc123"),
+				Type:     github.Ptr("file"),
+				Content:  github.Ptr(encodedContent),
+				Size:     github.Ptr(len(content)),
+				Encoding: github.Ptr("base64"),
+			}
+			contentBytes, _ := json.Marshal(fileContent)
+			_, _ = w.Write(contentBytes)
+		},
+	}))
+	mockRawClient, err := raw.NewClient(client, &url.URL{Scheme: "https", Host: "raw.example.com", Path: "/"})
+	require.NoError(t, err)
+	deps := BaseDeps{Client: client, RawClient: mockRawClient}
+	handler := serverTool.Handler(deps)
+	request := createMCPRequest(map[string]any{
+		"owner":      "owner",
+		"repo":       "repo",
+		"path":       "README.md",
+		"ref":        "refs/heads/main",
+		"start_line": 2,
+		"end_line":   3,
+	})
+
+	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+	require.NoError(t, err)
+	textContent := getTextResult(t, result)
+	assert.Contains(t, textContent.Text, "two\nthree")
+	sc, ok := result.StructuredContent.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 2, sc["start_line"])
+	assert.Equal(t, 3, sc["end_line"])
+	assert.Equal(t, "two\nthree", sc["content"])
 }
 
 // Test_GetCommit_IFC_FeatureFlag verifies that the IFC security label is only
@@ -1402,11 +1341,7 @@ func Test_ListCommits(t *testing.T) {
 	// Verify tool definition once
 	serverTool := ListCommits(translations.NullTranslationHelper)
 	tool := serverTool.Tool
-	// ListCommits is the FeatureFlagFieldsParam-enabled variant; it owns the
-	// _ff_<flag> snapshot. The canonical list_commits.snap is owned by
-	// LegacyListCommits (see Test_LegacyListCommits_Definition).
-	require.NoError(t, toolsnaps.Test(tool.Name+"_ff_"+FeatureFlagFieldsParam, tool))
-	require.Equal(t, FeatureFlagFieldsParam, serverTool.FeatureFlagEnable)
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
 
 	schema, ok := tool.InputSchema.(*jsonschema.Schema)
 	require.True(t, ok, "InputSchema should be *jsonschema.Schema")
@@ -1422,7 +1357,6 @@ func Test_ListCommits(t *testing.T) {
 	assert.Contains(t, schema.Properties, "until")
 	assert.Contains(t, schema.Properties, "page")
 	assert.Contains(t, schema.Properties, "perPage")
-	assert.Contains(t, schema.Properties, "fields")
 	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo"})
 
 	// Setup mock commits for success case
@@ -1722,7 +1656,7 @@ func Test_CreateOrUpdateFile(t *testing.T) {
 	assert.Contains(t, schema.Properties, "message")
 	assert.Contains(t, schema.Properties, "branch")
 	assert.Contains(t, schema.Properties, "sha")
-	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "path", "content", "message", "branch"})
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "path", "message", "branch"})
 
 	// Setup mock file content response
 	mockFileResponse := &github.RepositoryContentResponse{
@@ -2066,6 +2000,333 @@ func Test_CreateOrUpdateFile(t *testing.T) {
 			assert.Equal(t, tc.expectedContent.Commit.Author.GetName(), returnedContent.Commit.Author.Name)
 			assert.Equal(t, tc.expectedContent.Commit.Author.GetEmail(), returnedContent.Commit.Author.Email)
 			assert.NotEmpty(t, returnedContent.Commit.Author.Date)
+		})
+	}
+}
+
+func Test_CreateOrUpdateFileFromSharedPath(t *testing.T) {
+	serverTool := CreateOrUpdateFileFromSharedPath(translations.NullTranslationHelper)
+	tool := serverTool.Tool
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
+
+	schema, ok := tool.InputSchema.(*jsonschema.Schema)
+	require.True(t, ok, "InputSchema should be *jsonschema.Schema")
+
+	assert.Equal(t, "create_or_update_file_from_shared_path", tool.Name)
+	assert.Contains(t, schema.Properties, "shared_path")
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "path", "shared_path", "message", "branch"})
+
+	tempRoot := t.TempDir()
+	t.Setenv("GITHUB_MCP_SHARED_ROOT", tempRoot)
+
+	sharedRelPath := "patches/worker.js"
+	sharedAbsPath := filepath.Join(tempRoot, sharedRelPath)
+	require.NoError(t, os.MkdirAll(filepath.Dir(sharedAbsPath), 0o755))
+	require.NoError(t, os.WriteFile(sharedAbsPath, []byte("console.log('patched worker');\n"), 0o644))
+
+	mockFileResponse := &github.RepositoryContentResponse{
+		Content: &github.RepositoryContent{
+			Name:    github.Ptr("worker.js"),
+			Path:    github.Ptr("src/worker.js"),
+			SHA:     github.Ptr("worker-sha"),
+			Size:    github.Ptr(30),
+			HTMLURL: github.Ptr("https://github.com/owner/repo/blob/feature/src/worker.js"),
+		},
+		Commit: github.Commit{
+			SHA:     github.Ptr("commit-sha"),
+			Message: github.Ptr("Patch worker"),
+			HTMLURL: github.Ptr("https://github.com/owner/repo/commit/commit-sha"),
+			Author: &github.CommitAuthor{
+				Name:  github.Ptr("Test User"),
+				Email: github.Ptr("test@example.com"),
+				Date:  &github.Timestamp{Time: time.Now()},
+			},
+		},
+	}
+
+	tests := []struct {
+		name           string
+		mockedClient   *http.Client
+		requestArgs    map[string]any
+		expectError    bool
+		expectedErrMsg string
+		validate       func(t *testing.T, result *mcp.CallToolResult)
+	}{
+		{
+			name: "successful shared path update",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				"GET /repos/owner/repo/contents/src/worker.js": mockResponse(t, http.StatusOK, &github.RepositoryContent{
+					SHA:  github.Ptr("old-sha"),
+					Type: github.Ptr("file"),
+				}),
+				"GET /repos/{owner}/{repo}/contents/{path:.*}": mockResponse(t, http.StatusOK, &github.RepositoryContent{
+					SHA:  github.Ptr("old-sha"),
+					Type: github.Ptr("file"),
+				}),
+				PutReposContentsByOwnerByRepoByPath: expectRequestBody(t, map[string]any{
+					"message": "Patch worker",
+					"content": base64.StdEncoding.EncodeToString([]byte("console.log('patched worker');\n")),
+					"branch":  "feature/test",
+					"sha":     "old-sha",
+				}).andThen(
+					mockResponse(t, http.StatusOK, mockFileResponse),
+				),
+				"PUT /repos/{owner}/{repo}/contents/{path:.*}": expectRequestBody(t, map[string]any{
+					"message": "Patch worker",
+					"content": base64.StdEncoding.EncodeToString([]byte("console.log('patched worker');\n")),
+					"branch":  "feature/test",
+					"sha":     "old-sha",
+				}).andThen(
+					mockResponse(t, http.StatusOK, mockFileResponse),
+				),
+			}),
+			requestArgs: map[string]any{
+				"owner":       "owner",
+				"repo":        "repo",
+				"path":        "src/worker.js",
+				"shared_path": sharedRelPath,
+				"message":     "Patch worker",
+				"branch":      "feature/test",
+				"sha":         "old-sha",
+			},
+			validate: func(t *testing.T, result *mcp.CallToolResult) {
+				require.NotNil(t, result.StructuredContent)
+				structured, ok := result.StructuredContent.(map[string]any)
+				require.True(t, ok)
+				source, ok := structured["source"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, "shared_path", source["type"])
+				assert.Equal(t, sharedRelPath, source["shared_path"])
+				assert.EqualValues(t, len([]byte("console.log('patched worker');\n")), source["size_bytes"])
+			},
+		},
+		{
+			name:         "reject absolute path",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: map[string]any{
+				"owner":       "owner",
+				"repo":        "repo",
+				"path":        "src/worker.js",
+				"shared_path": "/etc/passwd",
+				"message":     "Patch worker",
+				"branch":      "feature/test",
+			},
+			expectError:    true,
+			expectedErrMsg: "shared_path must be relative to the shared directory",
+		},
+		{
+			name:         "reject path traversal",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: map[string]any{
+				"owner":       "owner",
+				"repo":        "repo",
+				"path":        "src/worker.js",
+				"shared_path": "../secrets.txt",
+				"message":     "Patch worker",
+				"branch":      "feature/test",
+			},
+			expectError:    true,
+			expectedErrMsg: "shared_path must stay within the shared directory",
+		},
+		{
+			name:         "reject missing shared file",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: map[string]any{
+				"owner":       "owner",
+				"repo":        "repo",
+				"path":        "src/worker.js",
+				"shared_path": "missing/worker.js",
+				"message":     "Patch worker",
+				"branch":      "feature/test",
+			},
+			expectError:    true,
+			expectedErrMsg: "failed to resolve shared_path",
+		},
+		{
+			name:         "reject symlink escape",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: func() map[string]any {
+				outsideDir := t.TempDir()
+				outsideFile := filepath.Join(outsideDir, "secret.txt")
+				require.NoError(t, os.WriteFile(outsideFile, []byte("secret"), 0o644))
+				require.NoError(t, os.Symlink(outsideFile, filepath.Join(tempRoot, "escape.txt")))
+				return map[string]any{
+					"owner":       "owner",
+					"repo":        "repo",
+					"path":        "src/worker.js",
+					"shared_path": "escape.txt",
+					"message":     "Patch worker",
+					"branch":      "feature/test",
+				}
+			}(),
+			expectError:    true,
+			expectedErrMsg: "shared_path must stay within the shared directory",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := mustNewGHClient(t, tc.mockedClient)
+			deps := BaseDeps{Client: client}
+			handler := serverTool.Handler(deps)
+			request := createMCPRequest(tc.requestArgs)
+
+			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+			require.NoError(t, err)
+
+			if tc.expectError {
+				require.True(t, result.IsError)
+				errorContent := getErrorResult(t, result)
+				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
+				return
+			}
+
+			require.False(t, result.IsError)
+			textContent := getTextResult(t, result)
+			var returnedContent MinimalFileContentResponse
+			err = json.Unmarshal([]byte(textContent.Text), &returnedContent)
+			require.NoError(t, err)
+			assert.Equal(t, "src/worker.js", returnedContent.Content.Path)
+			assert.Equal(t, "commit-sha", returnedContent.Commit.SHA)
+			if tc.validate != nil {
+				tc.validate(t, result)
+			}
+		})
+	}
+}
+
+func Test_PushFilesFromSharedPaths(t *testing.T) {
+	serverTool := PushFilesFromSharedPaths(translations.NullTranslationHelper)
+	tool := serverTool.Tool
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
+
+	schema, ok := tool.InputSchema.(*jsonschema.Schema)
+	require.True(t, ok, "InputSchema should be *jsonschema.Schema")
+	assert.Equal(t, "push_files_from_shared_paths", tool.Name)
+	assert.Contains(t, schema.Properties, "files")
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "branch", "files", "message"})
+
+	tempRoot := t.TempDir()
+	t.Setenv("GITHUB_MCP_SHARED_ROOT", tempRoot)
+	require.NoError(t, os.MkdirAll(filepath.Join(tempRoot, "batch"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(tempRoot, "batch", "one.js"), []byte("export const one = 1;\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(tempRoot, "batch", "two.js"), []byte(strings.Repeat("x", 32*1024)), 0o644))
+
+	tests := []struct {
+		name           string
+		mockedClient   *http.Client
+		requestArgs    map[string]any
+		expectError    bool
+		expectedErrMsg string
+		validate       func(t *testing.T, result *mcp.CallToolResult)
+	}{
+		{
+			name: "successful multi-file push",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				"GET /repos/owner/repo/git/ref/heads/feature/test": mockResponse(t, http.StatusOK, &github.Reference{
+					Ref: github.Ptr("refs/heads/feature/test"),
+					Object: &github.GitObject{
+						SHA: github.Ptr("base-commit-sha"),
+					},
+				}),
+				"GET /repos/{owner}/{repo}/git/ref/{ref:.*}": mockResponse(t, http.StatusOK, &github.Reference{
+					Ref: github.Ptr("refs/heads/feature/test"),
+					Object: &github.GitObject{
+						SHA: github.Ptr("base-commit-sha"),
+					},
+				}),
+				"GET /repos/owner/repo/git/commits/base-commit-sha": mockResponse(t, http.StatusOK, &github.Commit{
+					SHA:  github.Ptr("base-commit-sha"),
+					Tree: &github.Tree{SHA: github.Ptr("base-tree-sha")},
+				}),
+				"GET /repos/{owner}/{repo}/git/commits/{commit_sha}": mockResponse(t, http.StatusOK, &github.Commit{
+					SHA:  github.Ptr("base-commit-sha"),
+					Tree: &github.Tree{SHA: github.Ptr("base-tree-sha")},
+				}),
+				"POST /repos/owner/repo/git/trees": mockResponse(t, http.StatusCreated, &github.Tree{
+					SHA: github.Ptr("new-tree-sha"),
+				}),
+				"POST /repos/{owner}/{repo}/git/trees": mockResponse(t, http.StatusCreated, &github.Tree{
+					SHA: github.Ptr("new-tree-sha"),
+				}),
+				"POST /repos/owner/repo/git/commits": mockResponse(t, http.StatusCreated, &github.Commit{
+					SHA: github.Ptr("new-commit-sha"),
+				}),
+				"POST /repos/{owner}/{repo}/git/commits": mockResponse(t, http.StatusCreated, &github.Commit{
+					SHA: github.Ptr("new-commit-sha"),
+				}),
+				"PATCH /repos/owner/repo/git/refs/heads/feature/test": mockResponse(t, http.StatusOK, &github.Reference{
+					Ref: github.Ptr("refs/heads/feature/test"),
+					Object: &github.GitObject{
+						SHA: github.Ptr("new-commit-sha"),
+					},
+				}),
+				"PATCH /repos/{owner}/{repo}/git/refs/{ref:.*}": mockResponse(t, http.StatusOK, &github.Reference{
+					Ref: github.Ptr("refs/heads/feature/test"),
+					Object: &github.GitObject{
+						SHA: github.Ptr("new-commit-sha"),
+					},
+				}),
+			}),
+			requestArgs: map[string]any{
+				"owner":   "owner",
+				"repo":    "repo",
+				"branch":  "feature/test",
+				"message": "Batch patch",
+				"files": []any{
+					map[string]any{"path": "src/one.js", "shared_path": "batch/one.js"},
+					map[string]any{"path": "src/two.js", "shared_path": "batch/two.js"},
+				},
+			},
+			validate: func(t *testing.T, result *mcp.CallToolResult) {
+				textContent := getTextResult(t, result)
+				var resp SharedPushFilesResponse
+				err := json.Unmarshal([]byte(textContent.Text), &resp)
+				require.NoError(t, err)
+				assert.Equal(t, "new-commit-sha", resp.CommitSHA)
+				assert.Equal(t, "feature/test", resp.Branch)
+				assert.Equal(t, []string{"src/one.js", "src/two.js"}, resp.ChangedPaths)
+				assert.Equal(t, 2, resp.FileCount)
+			},
+		},
+		{
+			name:         "reject traversal in multi-file push",
+			mockedClient: NewMockedHTTPClient(),
+			requestArgs: map[string]any{
+				"owner":   "owner",
+				"repo":    "repo",
+				"branch":  "feature/test",
+				"message": "Batch patch",
+				"files": []any{
+					map[string]any{"path": "src/one.js", "shared_path": "../secret.txt"},
+				},
+			},
+			expectError:    true,
+			expectedErrMsg: "shared_path must stay within the shared directory",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := mustNewGHClient(t, tc.mockedClient)
+			deps := BaseDeps{Client: client}
+			handler := serverTool.Handler(deps)
+			request := createMCPRequest(tc.requestArgs)
+
+			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+			require.NoError(t, err)
+
+			if tc.expectError {
+				require.True(t, result.IsError)
+				errorContent := getErrorResult(t, result)
+				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
+				return
+			}
+
+			require.False(t, result.IsError)
+			if tc.validate != nil {
+				tc.validate(t, result)
+			}
 		})
 	}
 }
@@ -3641,14 +3902,352 @@ func Test_GetTag(t *testing.T) {
 	}
 }
 
+func Test_ManageBranch(t *testing.T) {
+	serverTool := ManageBranch(translations.NullTranslationHelper)
+	tool := serverTool.Tool
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
+	assert.Equal(t, "manage_branch", tool.Name)
+	schema := tool.InputSchema.(*jsonschema.Schema)
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "action", "branch"})
+
+	const sourceSHA = "1111111111111111111111111111111111111111"
+	const otherSHA = "2222222222222222222222222222222222222222"
+	commitBody := `{"sha":"` + sourceSHA + `","tree":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`
+
+	tests := []struct {
+		name        string
+		args        map[string]any
+		handlers    map[string]http.HandlerFunc
+		expectError bool
+		errorText   string
+		assertText  func(t *testing.T, text string)
+	}{
+		{
+			name: "create branch from branch name",
+			args: map[string]any{"owner": "owner", "repo": "repo", "action": "create", "branch": "work", "source_ref": "main"},
+			handlers: map[string]http.HandlerFunc{
+				GetReposGitRefByOwnerByRepoByRef: func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case strings.HasSuffix(r.URL.Path, "/heads/work"):
+						w.WriteHeader(http.StatusNotFound)
+					case strings.HasSuffix(r.URL.Path, "/heads/main"):
+						_, _ = w.Write([]byte(`{"ref":"refs/heads/main","object":{"type":"commit","sha":"` + sourceSHA + `"}}`))
+					default:
+						w.WriteHeader(http.StatusNotFound)
+					}
+				},
+				GetReposGitCommitsByOwnerByRepoByCommitSHA: mockResponse(t, http.StatusOK, commitBody),
+				PostReposGitRefsByOwnerByRepo: func(w http.ResponseWriter, r *http.Request) {
+					var body map[string]string
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+					assert.Equal(t, "refs/heads/work", body["ref"])
+					assert.Equal(t, sourceSHA, body["sha"])
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"ref":"refs/heads/work","object":{"type":"commit","sha":"` + sourceSHA + `"}}`))
+				},
+			},
+			assertText: func(t *testing.T, text string) {
+				var resp ManageBranchResponse
+				require.NoError(t, json.Unmarshal([]byte(text), &resp))
+				assert.Equal(t, "work", resp.Branch)
+				assert.Equal(t, sourceSHA, resp.ResolvedSourceSHA)
+				assert.Equal(t, sourceSHA, resp.CreatedBranchSHA)
+			},
+		},
+		{
+			name: "create branch from full commit SHA",
+			args: map[string]any{"owner": "owner", "repo": "repo", "action": "create", "branch": "work", "source_ref": sourceSHA, "expected_sha": sourceSHA},
+			handlers: map[string]http.HandlerFunc{
+				GetReposGitRefByOwnerByRepoByRef:           mockResponse(t, http.StatusNotFound, `{"message":"not found"}`),
+				GetReposGitCommitsByOwnerByRepoByCommitSHA: mockResponse(t, http.StatusOK, commitBody),
+				PostReposGitRefsByOwnerByRepo:              mockResponse(t, http.StatusCreated, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sourceSHA+`"}}`),
+			},
+			assertText: func(t *testing.T, text string) {
+				assert.Contains(t, text, sourceSHA)
+			},
+		},
+		{
+			name:        "expected source SHA mismatch",
+			args:        map[string]any{"owner": "owner", "repo": "repo", "action": "create", "branch": "work", "source_ref": sourceSHA, "expected_sha": otherSHA},
+			handlers:    map[string]http.HandlerFunc{GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusNotFound, nil), GetReposGitCommitsByOwnerByRepoByCommitSHA: mockResponse(t, http.StatusOK, commitBody)},
+			expectError: true,
+			errorText:   "expected_sha mismatch",
+		},
+		{
+			name:        "existing destination branch",
+			args:        map[string]any{"owner": "owner", "repo": "repo", "action": "create", "branch": "work", "source_ref": "main"},
+			handlers:    map[string]http.HandlerFunc{GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sourceSHA+`"}}`)},
+			expectError: true,
+			errorText:   "already exists",
+		},
+		{
+			name: "delete normal branch",
+			args: map[string]any{"owner": "owner", "repo": "repo", "action": "delete", "branch": "work", "expected_sha": sourceSHA},
+			handlers: map[string]http.HandlerFunc{
+				GetReposByOwnerByRepo:                mockResponse(t, http.StatusOK, `{"default_branch":"main"}`),
+				GetReposGitRefByOwnerByRepoByRef:     mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sourceSHA+`"}}`),
+				GetReposPullsByOwnerByRepo:           mockResponse(t, http.StatusOK, `[]`),
+				DeleteReposGitRefsByOwnerByRepoByRef: mockResponse(t, http.StatusNoContent, nil),
+			},
+			assertText: func(t *testing.T, text string) {
+				var resp ManageBranchResponse
+				require.NoError(t, json.Unmarshal([]byte(text), &resp))
+				assert.Equal(t, sourceSHA, resp.PriorHeadSHA)
+			},
+		},
+		{
+			name:        "expected head mismatch on delete",
+			args:        map[string]any{"owner": "owner", "repo": "repo", "action": "delete", "branch": "work", "expected_sha": otherSHA},
+			handlers:    map[string]http.HandlerFunc{GetReposByOwnerByRepo: mockResponse(t, http.StatusOK, `{"default_branch":"main"}`), GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sourceSHA+`"}}`), GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusOK, `[]`)},
+			expectError: true,
+			errorText:   "expected_sha mismatch",
+		},
+		{
+			name:        "refuse default branch deletion",
+			args:        map[string]any{"owner": "owner", "repo": "repo", "action": "delete", "branch": "main"},
+			handlers:    map[string]http.HandlerFunc{GetReposByOwnerByRepo: mockResponse(t, http.StatusOK, `{"default_branch":"main"}`)},
+			expectError: true,
+			errorText:   "default branch",
+		},
+		{
+			name:        "refuse deletion with open PR",
+			args:        map[string]any{"owner": "owner", "repo": "repo", "action": "delete", "branch": "work"},
+			handlers:    map[string]http.HandlerFunc{GetReposByOwnerByRepo: mockResponse(t, http.StatusOK, `{"default_branch":"main"}`), GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sourceSHA+`"}}`), GetReposPullsByOwnerByRepo: mockResponse(t, http.StatusOK, `[{"number":1,"state":"open"}]`)},
+			expectError: true,
+			errorText:   "open pull request",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(tc.handlers))}
+			result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(tc.args)))
+			require.NoError(t, err)
+			if tc.expectError {
+				require.True(t, result.IsError)
+				assert.Contains(t, getErrorResult(t, result).Text, tc.errorText)
+				return
+			}
+			require.False(t, result.IsError)
+			if tc.assertText != nil {
+				tc.assertText(t, getTextResult(t, result).Text)
+			}
+		})
+	}
+}
+
+func ptrRequest(r mcp.CallToolRequest) *mcp.CallToolRequest {
+	return &r
+}
+
+func Test_ApplyRepositoryChanges(t *testing.T) {
+	serverTool := ApplyRepositoryChanges(translations.NullTranslationHelper)
+	tool := serverTool.Tool
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
+	assert.Equal(t, "apply_repository_changes", tool.Name)
+	schema := tool.InputSchema.(*jsonschema.Schema)
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo", "branch", "message", "changes"})
+
+	const headSHA = "1111111111111111111111111111111111111111"
+	const newCommitSHA = "2222222222222222222222222222222222222222"
+	const baseTreeSHA = "3333333333333333333333333333333333333333"
+	const newTreeSHA = "4444444444444444444444444444444444444444"
+	const oldBlobSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const deleteBlobSHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	baseHandlers := func(t *testing.T, createTreeOK bool, updateRefSeen *bool) map[string]http.HandlerFunc {
+		refReads := 0
+		commitReads := 0
+		treeReads := 0
+		verifiedEntries := map[string]map[string]any{
+			"update.txt": {"path": "update.txt", "mode": "100644", "type": "blob", "sha": oldBlobSHA},
+			"delete.txt": {"path": "delete.txt", "mode": "100644", "type": "blob", "sha": deleteBlobSHA},
+			"keep.txt":   {"path": "keep.txt", "mode": "100644", "type": "blob", "sha": "cccccccccccccccccccccccccccccccccccccccc"},
+			"dir":        {"path": "dir", "mode": "040000", "type": "tree", "sha": "dddddddddddddddddddddddddddddddddddddddd"},
+		}
+		mapsToSortedEntries := func(entries map[string]map[string]any) []map[string]any {
+			result := make([]map[string]any, 0, len(entries))
+			for _, entry := range entries {
+				result = append(result, entry)
+			}
+			return result
+		}
+		return map[string]http.HandlerFunc{
+			GetReposGitRefByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				refReads++
+				sha := headSHA
+				if refReads > 1 {
+					sha = newCommitSHA
+				}
+				mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sha+`"}}`)(w, nil)
+			},
+			GetReposGitCommitsByOwnerByRepoByCommitSHA: func(w http.ResponseWriter, _ *http.Request) {
+				commitReads++
+				sha, tree := headSHA, baseTreeSHA
+				if commitReads > 1 {
+					sha, tree = newCommitSHA, newTreeSHA
+				}
+				mockResponse(t, http.StatusOK, `{"sha":"`+sha+`","tree":{"sha":"`+tree+`"},"parents":[{"sha":"`+headSHA+`"}]}`)(w, nil)
+			},
+			GetReposGitTreesByOwnerByRepoByTree: func(w http.ResponseWriter, _ *http.Request) {
+				treeReads++
+				if treeReads == 1 {
+					mockResponse(t, http.StatusOK, `{"sha":"`+baseTreeSHA+`","truncated":false,"tree":[{"path":"update.txt","mode":"100644","type":"blob","sha":"`+oldBlobSHA+`"},{"path":"delete.txt","mode":"100644","type":"blob","sha":"`+deleteBlobSHA+`"},{"path":"keep.txt","mode":"100644","type":"blob","sha":"cccccccccccccccccccccccccccccccccccccccc"},{"path":"dir","mode":"040000","type":"tree","sha":"dddddddddddddddddddddddddddddddddddddddd"}]} `)(w, nil)
+					return
+				}
+				encoded, err := json.Marshal(map[string]any{"sha": newTreeSHA, "truncated": false, "tree": mapsToSortedEntries(verifiedEntries)})
+				require.NoError(t, err)
+				mockResponse(t, http.StatusOK, json.RawMessage(encoded))(w, nil)
+			},
+			PostReposGitTreesByOwnerByRepo: func(w http.ResponseWriter, r *http.Request) {
+				if !createTreeOK {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"message":"tree failed"}`))
+					return
+				}
+				var body struct {
+					BaseTree string `json:"base_tree"`
+					Tree     []struct {
+						Path    string  `json:"path"`
+						Content *string `json:"content"`
+						SHA     *string `json:"sha"`
+					} `json:"tree"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				assert.Equal(t, baseTreeSHA, body.BaseTree)
+				for _, entry := range body.Tree {
+					if entry.Content == nil && entry.SHA == nil {
+						delete(verifiedEntries, entry.Path)
+						continue
+					}
+					verifiedEntries[entry.Path] = map[string]any{"path": entry.Path, "mode": "100644", "type": "blob", "sha": "generated-" + entry.Path}
+				}
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"sha":"` + newTreeSHA + `"}`))
+			},
+			PostReposGitCommitsByOwnerByRepo: mockResponse(t, http.StatusCreated, `{"sha":"`+newCommitSHA+`","tree":{"sha":"`+newTreeSHA+`"}}`),
+			PatchReposGitRefsByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				if updateRefSeen != nil {
+					*updateRefSeen = true
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"ref":"refs/heads/work","object":{"type":"commit","sha":"` + newCommitSHA + `"}}`))
+			},
+		}
+	}
+
+	tests := []struct {
+		name          string
+		args          map[string]any
+		handlers      map[string]http.HandlerFunc
+		expectError   bool
+		errorText     string
+		assertResult  func(t *testing.T, text string)
+		assertNoWrite *bool
+	}{
+		{
+			name:     "add one file",
+			args:     map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "add", "changes": []any{map[string]any{"path": "new.txt", "operation": "upsert", "content": "new\n"}}},
+			handlers: baseHandlers(t, true, nil),
+			assertResult: func(t *testing.T, text string) {
+				var resp ApplyRepositoryChangesResponse
+				require.NoError(t, json.Unmarshal([]byte(text), &resp))
+				assert.Equal(t, []string{"new.txt"}, resp.AddedPaths)
+				assert.Equal(t, newCommitSHA, resp.NewCommitSHA)
+				assert.Equal(t, newTreeSHA, resp.NewTreeSHA)
+			},
+		},
+		{
+			name:     "update one file with matching blob SHA",
+			args:     map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "update", "changes": []any{map[string]any{"path": "update.txt", "operation": "upsert", "content": "updated\n", "expected_blob_sha": oldBlobSHA}}},
+			handlers: baseHandlers(t, true, nil),
+			assertResult: func(t *testing.T, text string) {
+				var resp ApplyRepositoryChangesResponse
+				require.NoError(t, json.Unmarshal([]byte(text), &resp))
+				assert.Equal(t, []string{"update.txt"}, resp.UpdatedPaths)
+			},
+		},
+		{
+			name:     "delete one file with matching blob SHA",
+			args:     map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "delete", "changes": []any{map[string]any{"path": "delete.txt", "operation": "delete", "expected_blob_sha": deleteBlobSHA}}},
+			handlers: baseHandlers(t, true, nil),
+			assertResult: func(t *testing.T, text string) {
+				var resp ApplyRepositoryChangesResponse
+				require.NoError(t, json.Unmarshal([]byte(text), &resp))
+				assert.Equal(t, []string{"delete.txt"}, resp.DeletedPaths)
+			},
+		},
+		{
+			name: "add update and delete in one commit",
+			args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "atomic", "expected_head_sha": headSHA, "changes": []any{
+				map[string]any{"path": "new.txt", "operation": "upsert", "content": "new\n"},
+				map[string]any{"path": "update.txt", "operation": "upsert", "content": "updated\n", "expected_blob_sha": oldBlobSHA},
+				map[string]any{"path": "delete.txt", "operation": "delete", "expected_blob_sha": deleteBlobSHA},
+			}},
+			handlers: baseHandlers(t, true, nil),
+			assertResult: func(t *testing.T, text string) {
+				var resp ApplyRepositoryChangesResponse
+				require.NoError(t, json.Unmarshal([]byte(text), &resp))
+				assert.Equal(t, headSHA, resp.PreviousHeadSHA)
+				assert.Equal(t, []string{"new.txt"}, resp.AddedPaths)
+				assert.Equal(t, []string{"update.txt"}, resp.UpdatedPaths)
+				assert.Equal(t, []string{"delete.txt"}, resp.DeletedPaths)
+			},
+		},
+		{name: "expected branch head mismatch", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "expected_head_sha": newCommitSHA, "changes": []any{map[string]any{"path": "new.txt", "operation": "upsert", "content": "x"}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "expected_head_sha mismatch"},
+		{name: "expected blob mismatch", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "update.txt", "operation": "upsert", "content": "x", "expected_blob_sha": deleteBlobSHA}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "expected_blob_sha mismatch"},
+		{name: "duplicate paths rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "x.txt", "operation": "upsert", "content": "x"}, map[string]any{"path": "x.txt", "operation": "upsert", "content": "y"}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "duplicate path"},
+		{name: "traversal path rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "../x.txt", "operation": "upsert", "content": "x"}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "invalid repository file path"},
+		{name: "missing delete target rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "missing.txt", "operation": "delete", "expected_blob_sha": oldBlobSHA}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "cannot delete missing path"},
+		{name: "delete with content rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "delete.txt", "operation": "delete", "content": "x", "expected_blob_sha": deleteBlobSHA}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "content is not allowed"},
+		{name: "upsert without content rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "new.txt", "operation": "upsert"}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "content is required"},
+		{name: "no-op request rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "must not be empty"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(tc.handlers))}
+			result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(tc.args)))
+			require.NoError(t, err)
+			if tc.expectError {
+				require.True(t, result.IsError)
+				assert.Contains(t, getErrorResult(t, result).Text, tc.errorText)
+				return
+			}
+			require.False(t, result.IsError)
+			if tc.assertResult != nil {
+				tc.assertResult(t, getTextResult(t, result).Text)
+			}
+		})
+	}
+
+	t.Run("validation failure creates no commit and changes no ref", func(t *testing.T) {
+		updateRefSeen := false
+		handlers := baseHandlers(t, true, &updateRefSeen)
+		deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(handlers))}
+		args := map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "missing.txt", "operation": "delete", "expected_blob_sha": oldBlobSHA}}}
+		result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(args)))
+		require.NoError(t, err)
+		require.True(t, result.IsError)
+		assert.False(t, updateRefSeen)
+	})
+
+	t.Run("GitHub failure before ref update leaves branch unchanged", func(t *testing.T) {
+		updateRefSeen := false
+		handlers := baseHandlers(t, false, &updateRefSeen)
+		deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(handlers))}
+		args := map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "new.txt", "operation": "upsert", "content": "x"}}}
+		result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(args)))
+		require.NoError(t, err)
+		require.True(t, result.IsError)
+		assert.False(t, updateRefSeen)
+	})
+}
+
 func Test_ListReleases(t *testing.T) {
 	serverTool := ListReleases(translations.NullTranslationHelper)
 	tool := serverTool.Tool
-	// ListReleases is the FeatureFlagFieldsParam-enabled variant; it owns the
-	// _ff_<flag> snapshot. The canonical list_releases.snap is owned by
-	// LegacyListReleases (see Test_LegacyListReleases_Definition).
-	require.NoError(t, toolsnaps.Test(tool.Name+"_ff_"+FeatureFlagFieldsParam, tool))
-	require.Equal(t, FeatureFlagFieldsParam, serverTool.FeatureFlagEnable)
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
 
 	schema, ok := tool.InputSchema.(*jsonschema.Schema)
 	require.True(t, ok, "InputSchema should be *jsonschema.Schema")
@@ -3657,7 +4256,6 @@ func Test_ListReleases(t *testing.T) {
 	assert.NotEmpty(t, tool.Description)
 	assert.Contains(t, schema.Properties, "owner")
 	assert.Contains(t, schema.Properties, "repo")
-	assert.Contains(t, schema.Properties, "fields")
 	assert.ElementsMatch(t, schema.Required, []string{"owner", "repo"})
 
 	mockReleases := []*github.RepositoryRelease{
@@ -3856,7 +4454,7 @@ func Test_GetReleaseByTag(t *testing.T) {
 		Body:    github.Ptr("This is the first stable release."),
 		Assets: []*github.ReleaseAsset{
 			{
-				ID:   github.Ptr(int64(1)),
+					ID:   github.Ptr(int64(1)),
 				Name: github.Ptr("release-v1.0.0.tar.gz"),
 			},
 		},

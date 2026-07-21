@@ -7,6 +7,24 @@
   "description": "List releases in a GitHub repository",
   "inputSchema": {
     "properties": {
+      "fields": {
+        "description": "Subset of fields to return for each release.",
+        "items": {
+          "enum": [
+            "id",
+            "tag_name",
+            "name",
+            "body",
+            "html_url",
+            "published_at",
+            "prerelease",
+            "draft",
+            "author"
+          ],
+          "type": "string"
+        },
+        "type": "array"
+      },
       "owner": {
         "description": "Repository owner",
         "type": "string"
