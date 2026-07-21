@@ -8,7 +8,7 @@ import (
 	"net/http"
 
 	"github.com/go-viper/mapstructure/v2"
-	"github.com/google/go-github/v87/github"
+	"github.com/google/go-github/v89/github"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shurcooL/githubv4"
@@ -115,7 +115,7 @@ Possible options:
 			// visibility lookup fails the label is omitted rather than
 			// misclassifying the result.
 			attachIFC := func(r *mcp.CallToolResult) *mcp.CallToolResult {
-				return attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, r, ifc.LabelListIssues)
+				return attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, r, ifc.LabelRepoUserContent)
 			}
 
 			switch method {
@@ -587,6 +587,9 @@ func GetPullRequestReviews(ctx context.Context, client *github.Client, deps Tool
 // PullRequestWriteUIResourceURI is the URI for the create_pull_request tool's MCP App UI resource.
 const PullRequestWriteUIResourceURI = "ui://github-mcp-server/pr-write"
 
+// PullRequestEditUIResourceURI is the URI for the update_pull_request tool's MCP App UI resource.
+const PullRequestEditUIResourceURI = "ui://github-mcp-server/pr-edit"
+
 // pullRequestWriteFormParams are the parameters the create_pull_request MCP App
 // form collects and re-sends on submit. Any other parameter present on a call
 // cannot be represented by the form.
@@ -599,24 +602,22 @@ var pullRequestWriteFormParams = map[string]struct{}{
 	"base":                  {},
 	"draft":                 {},
 	"maintainer_can_modify": {},
-	"show_ui":               {},
+	"reviewers":             {},
 	"_ui_submitted":         {},
 }
 
-// pullRequestWriteHasNonFormParams reports whether the call carries any parameter
-// the create_pull_request MCP App form cannot represent (anything outside
-// pullRequestWriteFormParams). Such calls must bypass the UI form and execute
-// directly so the supplied values aren't silently dropped.
-func pullRequestWriteHasNonFormParams(args map[string]any) bool {
-	for key, value := range args {
-		if value == nil {
-			continue
-		}
-		if _, ok := pullRequestWriteFormParams[key]; !ok {
-			return true
-		}
-	}
-	return false
+var pullRequestUpdateFormParams = map[string]struct{}{
+	"owner":                 {},
+	"repo":                  {},
+	"pullNumber":            {},
+	"title":                 {},
+	"body":                  {},
+	"state":                 {},
+	"draft":                 {},
+	"base":                  {},
+	"maintainer_can_modify": {},
+	"reviewers":             {},
+	"_ui_submitted":         {},
 }
 
 // CreatePullRequest creates a tool to create a new pull request.
@@ -671,16 +672,12 @@ func CreatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 						Type:        "boolean",
 						Description: "Allow maintainer edits",
 					},
-					// show_ui is hidden from clients that do not advertise MCP App
-					// UI support. The strip happens per-request in
-					// inventory.ToolsForRegistration; it is present in the static
-					// schema (and therefore in toolsnaps and the feature-flag /
-					// insiders docs) so the UI-capable surface is fully
-					// documented. It is intentionally not in the main README,
-					// which renders the stripped (non-UI) schema.
-					"show_ui": {
-						Type:        "boolean",
-						Description: "Whether to render the MCP App form instead of executing the request immediately. Defaults to true. Set to false to skip the form and execute directly — useful when you have all required values (especially ones the form does not collect, like reviewers) and the user has already confirmed the action.",
+					"reviewers": {
+						Type:        "array",
+						Description: "GitHub usernames or ORG/team-slug team reviewers to request reviews from",
+						Items: &jsonschema.Schema{
+							Type: "string",
+						},
 					},
 				},
 				Required: []string{"owner", "repo", "title", "head", "base"},
@@ -697,20 +694,17 @@ func CreatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 
-			// When MCP Apps are enabled and the client supports UI, route the
-			// call to the interactive form unless:
-			//   - it is itself a form submission (the UI sends _ui_submitted=true),
-			//   - the caller explicitly asked to skip the UI (show_ui=false), or
-			//   - it carries parameters the form cannot represent. Those must be
-			//     applied directly so their values aren't silently dropped.
-			uiSubmitted, _ := OptionalParam[bool](args, "_ui_submitted")
-			showUI, err := OptionalBoolParamWithDefault(args, "show_ui", true)
-			if err != nil {
-				return utils.NewToolResultError(err.Error()), nil, nil
-			}
-
-			if deps.IsFeatureEnabled(ctx, MCPAppsFeatureFlag) && clientSupportsUI(ctx, req) && !uiSubmitted && showUI && !pullRequestWriteHasNonFormParams(args) {
-				return utils.NewToolResultText(fmt.Sprintf("Ready to create a pull request in %s/%s. IMPORTANT: The PR has NOT been created yet. Do NOT tell the user the PR was created. The user MUST click Submit in the form to create it.", owner, repo)), nil, nil
+			// Hand off to the interactive MCP App form unless this call must
+			// execute now (see shouldDeferToForm).
+			if shouldDeferToForm(ctx, deps, req, args, pullRequestWriteFormParams) {
+				return utils.NewToolResultAwaitingFormSubmission(fmt.Sprintf(
+					"An interactive form has been shown to the user for creating a new pull request in %s/%s. "+
+						"STOP — do not call any other tools, do not respond as if the pull request was created, "+
+						"and do not claim the operation succeeded. The pull request has NOT been created yet; "+
+						"only the form was rendered. Wait silently for the user to review and click Submit. "+
+						"When they do, the real result will be delivered to your context automatically.",
+					owner, repo,
+				)), nil, nil
 			}
 
 			// When creating PR, title/head/base are required
@@ -747,6 +741,11 @@ func CreatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 			}
 
 			maintainerCanModify, err := OptionalParam[bool](args, "maintainer_can_modify")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			reviewers, err := OptionalStringArrayParam(args, "reviewers")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -789,6 +788,36 @@ func CreatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 			closeResponse(verifyResp)
 			if verifyErr != nil || verifiedPR == nil || verifiedPR.GetNumber() != pr.GetNumber() || verifiedPR.GetBase().GetRepo().GetFullName() != owner+"/"+repo {
 				return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: created pull request target does not match the requested repository"), nil, nil
+			}
+
+			if len(reviewers) > 0 {
+				userReviewers, teamReviewers := splitPullRequestReviewers(reviewers)
+				reviewersRequest := github.ReviewersRequest{
+					Reviewers:     userReviewers,
+					TeamReviewers: teamReviewers,
+				}
+
+				_, reviewerResp, err := client.PullRequests.RequestReviewers(ctx, owner, repo, pr.GetNumber(), reviewersRequest)
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx,
+						"failed to request reviewers",
+						reviewerResp,
+						err,
+					), nil, nil
+				}
+				defer func() {
+					if reviewerResp != nil && reviewerResp.Body != nil {
+						_ = reviewerResp.Body.Close()
+					}
+				}()
+
+				if reviewerResp.StatusCode != http.StatusCreated && reviewerResp.StatusCode != http.StatusOK {
+					bodyBytes, err := io.ReadAll(reviewerResp.Body)
+					if err != nil {
+						return utils.NewToolResultErrorFromErr("failed to read response body", err), nil, nil
+					}
+					return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to request reviewers", reviewerResp, bodyBytes), nil, nil
+				}
 			}
 
 			// Return minimal response with just essential information
@@ -873,10 +902,16 @@ func UpdatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 				Title:        t("TOOL_UPDATE_PULL_REQUEST_USER_TITLE", "Edit pull request"),
 				ReadOnlyHint: false,
 			},
+			Meta: mcp.Meta{
+				"ui": map[string]any{
+					"resourceUri": PullRequestEditUIResourceURI,
+					"visibility":  []string{"model", "app"},
+				},
+			},
 			InputSchema: schema,
 		},
 		[]scopes.Scope{scopes.Repo},
-		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+		func(ctx context.Context, deps ToolDependencies, req *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
 			owner, err := RequiredParam[string](args, "owner")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
@@ -888,6 +923,19 @@ func UpdatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 			pullNumber, err := RequiredInt(args, "pullNumber")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			// Hand off to the interactive MCP App form unless this call must
+			// execute now (see shouldDeferToForm).
+			if shouldDeferToForm(ctx, deps, req, args, pullRequestUpdateFormParams) {
+				return utils.NewToolResultAwaitingFormSubmission(fmt.Sprintf(
+					"An interactive form has been shown to the user for editing pull request #%d in %s/%s. "+
+						"STOP — do not call any other tools, do not respond as if the pull request was updated, "+
+						"and do not claim the operation succeeded. The pull request has NOT been updated yet; "+
+						"only the form was rendered. Wait silently for the user to review and click Submit. "+
+						"When they do, the real result will be delivered to your context automatically.",
+					pullNumber, owner, repo,
+				)), nil, nil
 			}
 
 			_, draftProvided := args["draft"]
@@ -1126,7 +1174,7 @@ func UpdatePullRequest(t translations.TranslationHelperFunc) inventory.ServerToo
 	return st
 }
 
-// AddReplyToPullRequestComment creates a tool to add a reply to an existing pull request comment.
+// AddReplyToPullRequestComment creates a tool to add a reply or reaction to an existing pull request comment.
 func AddReplyToPullRequestComment(t translations.TranslationHelperFunc) inventory.ServerTool {
 	schema := &jsonschema.Schema{
 		Type: "object",
@@ -1141,25 +1189,31 @@ func AddReplyToPullRequestComment(t translations.TranslationHelperFunc) inventor
 			},
 			"pullNumber": {
 				Type:        "number",
-				Description: "Pull request number",
+				Description: "Pull request number. Required when body is provided.",
 			},
 			"commentId": {
 				Type:        "number",
-				Description: "The ID of the comment to reply to",
+				Description: "The numeric ID of the pull request review comment to reply or react to. Use the number from a #discussion_r... anchor, not the GraphQL thread node ID (PRRT_...).",
+				Minimum:     jsonschema.Ptr(1.0),
 			},
 			"body": {
 				Type:        "string",
-				Description: "The text of the reply",
+				Description: "The text of the reply. Required unless reaction is provided.",
+			},
+			"reaction": {
+				Type:        "string",
+				Description: "Emoji reaction to add. Required unless body is provided.",
+				Enum:        []any{"+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"},
 			},
 		},
-		Required: []string{"owner", "repo", "pullNumber", "commentId", "body"},
+		Required: []string{"owner", "repo", "commentId"},
 	}
 
 	return NewTool(
 		ToolsetMetadataPullRequests,
 		mcp.Tool{
 			Name:        "add_reply_to_pull_request_comment",
-			Description: t("TOOL_ADD_REPLY_TO_PULL_REQUEST_COMMENT_DESCRIPTION", "Add a reply to an existing pull request comment. This creates a new comment that is linked as a reply to the specified comment."),
+			Description: t("TOOL_ADD_REPLY_TO_PULL_REQUEST_COMMENT_DESCRIPTION", "Add a reply and/or reaction to an existing pull request comment. This can create a new comment linked as a reply to the specified comment, add an emoji reaction to the specified comment, or do both. At least one of body or reaction is required."),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_ADD_REPLY_TO_PULL_REQUEST_COMMENT_USER_TITLE", "Add reply to pull request comment"),
 				ReadOnlyHint: false,
@@ -1176,17 +1230,36 @@ func AddReplyToPullRequestComment(t translations.TranslationHelperFunc) inventor
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			pullNumber, err := RequiredInt(args, "pullNumber")
+			commentID, err := RequiredBigInt(args, "commentId")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			commentID, err := RequiredInt(args, "commentId")
+			if commentID < 1 {
+				return utils.NewToolResultError("commentId must be greater than 0"), nil, nil
+			}
+			body, hasBody, err := OptionalParamOK[string](args, "body")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			body, err := RequiredParam[string](args, "body")
+			reactionContent, hasReaction, err := OptionalParamOK[string](args, "reaction")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if !hasBody && !hasReaction {
+				return utils.NewToolResultError("at least one of body or reaction is required"), nil, nil
+			}
+			if hasBody && body == "" {
+				return utils.NewToolResultError("body cannot be empty when provided"), nil, nil
+			}
+			if hasReaction && reactionContent == "" {
+				return utils.NewToolResultError("reaction cannot be empty when provided"), nil, nil
+			}
+			var pullNumber int
+			if hasBody {
+				pullNumber, err = RequiredInt(args, "pullNumber")
+				if err != nil {
+					return utils.NewToolResultError(err.Error()), nil, nil
+				}
 			}
 
 			client, err := deps.GetClient(ctx)
@@ -1194,21 +1267,52 @@ func AddReplyToPullRequestComment(t translations.TranslationHelperFunc) inventor
 				return utils.NewToolResultErrorFromErr("failed to get GitHub client", err), nil, nil
 			}
 
-			comment, resp, err := client.PullRequests.CreateCommentInReplyTo(ctx, owner, repo, pullNumber, body, int64(commentID))
-			if err != nil {
-				return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to add reply to pull request comment", resp, err), nil, nil
-			}
-			defer func() { _ = resp.Body.Close() }()
-
-			if resp.StatusCode != http.StatusCreated {
-				bodyBytes, err := io.ReadAll(resp.Body)
+			var reactionResponse *MinimalResponse
+			if hasReaction {
+				reaction, resp, err := client.Reactions.CreatePullRequestCommentReaction(ctx, owner, repo, commentID, reactionContent)
 				if err != nil {
-					return utils.NewToolResultErrorFromErr("failed to read response body", err), nil, nil
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to add reaction to pull request review comment", resp, err), nil, nil
 				}
-				return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to add reply to pull request comment", resp, bodyBytes), nil, nil
+				defer func() { _ = resp.Body.Close() }()
+
+				reactionResponse = &MinimalResponse{
+					ID:  fmt.Sprintf("%d", reaction.GetID()),
+					URL: fmt.Sprintf("%srepos/%s/%s/pulls/comments/%d/reactions/%d", client.BaseURL(), owner, repo, commentID, reaction.GetID()),
+				}
 			}
 
-			r, err := json.Marshal(comment)
+			var comment *github.PullRequestComment
+			if hasBody {
+				var resp *github.Response
+				comment, resp, err = client.PullRequests.CreateCommentInReplyTo(ctx, owner, repo, pullNumber, body, commentID)
+				if err != nil {
+					return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to add reply to pull request comment", resp, err), nil, nil
+				}
+				defer func() { _ = resp.Body.Close() }()
+
+				if resp.StatusCode != http.StatusCreated {
+					bodyBytes, err := io.ReadAll(resp.Body)
+					if err != nil {
+						return utils.NewToolResultErrorFromErr("failed to read response body", err), nil, nil
+					}
+					return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to add reply to pull request comment", resp, bodyBytes), nil, nil
+				}
+			}
+
+			var result any
+			switch {
+			case hasBody && hasReaction:
+				result = map[string]any{
+					"comment":  comment,
+					"reaction": reactionResponse,
+				}
+			case hasReaction:
+				result = reactionResponse
+			default:
+				result = comment
+			}
+
+			r, err := json.Marshal(result)
 			if err != nil {
 				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
 			}
@@ -1217,8 +1321,35 @@ func AddReplyToPullRequestComment(t translations.TranslationHelperFunc) inventor
 		})
 }
 
-// ListPullRequests creates a tool to list and filter repository pull requests.
+// ListPullRequests creates a tool to list pull requests in a GitHub repository.
+// It is the FeatureFlagFieldsParam-enabled variant: it advertises the optional
+// `fields` parameter and filters each pull request to the requested subset. Both
+// this and LegacyListPullRequests register under the tool name
+// "list_pull_requests"; exactly one is active for any given request thanks to
+// mutually exclusive FeatureFlagEnable / FeatureFlagDisable annotations.
 func ListPullRequests(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := listPullRequestsTool(t, true)
+	st.FeatureFlagEnable = FeatureFlagFieldsParam
+	return st
+}
+
+// LegacyListPullRequests is the FeatureFlagFieldsParam-disabled variant of
+// list_pull_requests. It exposes the original schema (no `fields` parameter) and
+// never filters results, so it acts as the kill switch when the flag is off. It
+// owns the canonical list_pull_requests.snap; the flag-enabled variant owns
+// list_pull_requests_ff_<flag>.snap. Delete this function when the flag is
+// removed.
+func LegacyListPullRequests(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := listPullRequestsTool(t, false)
+	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
+	return st
+}
+
+// listPullRequestsTool builds the list_pull_requests tool. When includeFields is
+// true the tool advertises the optional `fields` parameter, filters each pull
+// request to the requested subset, and emits fields telemetry. When false it is
+// the original tool with no fields parameter and no filtering.
+func listPullRequestsTool(t translations.TranslationHelperFunc, includeFields bool) inventory.ServerTool {
 	schema := &jsonschema.Schema{
 		Type: "object",
 		Properties: map[string]*jsonschema.Schema{
@@ -1255,6 +1386,12 @@ func ListPullRequests(t translations.TranslationHelperFunc) inventory.ServerTool
 			},
 		},
 		Required: []string{"owner", "repo"},
+	}
+	if includeFields {
+		schema.Properties["fields"] = fieldsSchemaProperty(
+			"Subset of fields to return for each pull request. If omitted, all fields are returned. Use this to reduce response size when you only need specific fields; omitting 'body' in particular drops the largest per-result data.",
+			listPullRequestsItemFieldEnum,
+		)
 	}
 	WithPagination(schema)
 
@@ -1298,6 +1435,13 @@ func ListPullRequests(t translations.TranslationHelperFunc) inventory.ServerTool
 			direction, err := OptionalParam[string](args, "direction")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			var fields []string
+			if includeFields {
+				fields, err = OptionalStringArrayParam(args, "fields")
+				if err != nil {
+					return utils.NewToolResultError(err.Error()), nil, nil
+				}
 			}
 			pagination, err := OptionalPaginationParams(args)
 			if err != nil {
@@ -1358,15 +1502,30 @@ func ListPullRequests(t translations.TranslationHelperFunc) inventory.ServerTool
 				}
 			}
 
-			r, err := json.Marshal(minimalPRs)
+			filtered := false
+			var payload any = minimalPRs
+			if includeFields && len(fields) > 0 {
+				filteredPRs, err := filterEachField(minimalPRs, fields)
+				if err != nil {
+					return utils.NewToolResultErrorFromErr("failed to filter pull requests", err), nil, nil
+				}
+				payload = filteredPRs
+				filtered = true
+			}
+
+			r, err := json.Marshal(payload)
 			if err != nil {
 				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
+			}
+
+			if includeFields {
+				recordFieldsUsageFor(ctx, deps, "list_pull_requests", minimalPRs, filtered, len(r))
 			}
 
 			result := utils.NewToolResultText(string(r))
 			// Pull request titles/bodies are user-authored (untrusted);
 			// confidentiality follows repo visibility.
-			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelListIssues)
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelRepoUserContent)
 			return result, nil, nil
 		})
 }
@@ -1486,8 +1645,35 @@ func MergePullRequest(t translations.TranslationHelperFunc) inventory.ServerTool
 		})
 }
 
-// SearchPullRequests creates a tool to search for pull requests.
+// SearchPullRequests creates a tool to search for pull requests. It is the
+// FeatureFlagFieldsParam-enabled variant: it advertises the optional `fields`
+// parameter and filters each result to the requested subset. Both this and
+// LegacySearchPullRequests register under the tool name "search_pull_requests";
+// exactly one is active for any given request thanks to mutually exclusive
+// FeatureFlagEnable / FeatureFlagDisable annotations.
 func SearchPullRequests(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := searchPullRequestsTool(t, true)
+	st.FeatureFlagEnable = FeatureFlagFieldsParam
+	return st
+}
+
+// LegacySearchPullRequests is the FeatureFlagFieldsParam-disabled variant of
+// search_pull_requests. It exposes the original schema (no `fields` parameter)
+// and never filters results, so it acts as the kill switch when the flag is off.
+// It owns the canonical search_pull_requests.snap; the flag-enabled variant owns
+// search_pull_requests_ff_<flag>.snap. Delete this function when the flag is
+// removed.
+func LegacySearchPullRequests(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := searchPullRequestsTool(t, false)
+	st.FeatureFlagDisable = []string{FeatureFlagFieldsParam}
+	return st
+}
+
+// searchPullRequestsTool builds the search_pull_requests tool. When
+// includeFields is true the tool advertises the optional `fields` parameter,
+// filters each result to the requested subset, and emits fields telemetry. When
+// false it is the original tool with no fields parameter and no filtering.
+func searchPullRequestsTool(t translations.TranslationHelperFunc, includeFields bool) inventory.ServerTool {
 	schema := &jsonschema.Schema{
 		Type: "object",
 		Properties: map[string]*jsonschema.Schema{
@@ -1528,6 +1714,12 @@ func SearchPullRequests(t translations.TranslationHelperFunc) inventory.ServerTo
 		},
 		Required: []string{"query"},
 	}
+	if includeFields {
+		schema.Properties["fields"] = fieldsSchemaProperty(
+			"Subset of fields to return for each pull request result. If omitted, all fields are returned. Use this to reduce response size when you only need specific fields; omitting 'body', 'reactions', and 'labels' in particular drops the largest per-result data.",
+			searchPullRequestsItemFieldEnum,
+		)
+	}
 	WithPagination(schema)
 
 	return NewTool(
@@ -1543,7 +1735,15 @@ func SearchPullRequests(t translations.TranslationHelperFunc) inventory.ServerTo
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
-			result, err := searchHandler(ctx, deps.GetClient, args, "pr", "failed to search pull requests", ifcSearchPostProcessOption(ctx, deps))
+			options := []searchOption{ifcSearchPostProcessOption(ctx, deps)}
+			if includeFields {
+				fields, err := OptionalStringArrayParam(args, "fields")
+				if err != nil {
+					return utils.NewToolResultError(err.Error()), nil, nil
+				}
+				options = append(options, withFieldsFiltering(deps, "search_pull_requests", fields))
+			}
+			result, err := searchHandler(ctx, deps.GetClient, args, "pr", "failed to search pull requests", options...)
 			return result, nil, err
 		})
 }
@@ -2213,38 +2413,74 @@ func AddCommentToPendingReview(t translations.TranslationHelperFunc) inventory.S
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
-			var params struct {
-				Owner       string
-				Repo        string
-				PullNumber  int32
-				Path        string
-				Body        string
-				SubjectType string
-				Line        *int32
-				Side        *string
-				StartLine   *int32
-				StartSide   *string
-			}
-			if err := mapstructure.WeakDecode(args, &params); err != nil {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			pullNumber, err := RequiredInt(args, "pullNumber")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			path, err := RequiredParam[string](args, "path")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			body, err := RequiredParam[string](args, "body")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			subjectType, err := RequiredParam[string](args, "subjectType")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			line, err := OptionalIntParam(args, "line")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			side, _ := OptionalParam[string](args, "side")
+			startLine, err := OptionalIntParam(args, "startLine")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			startSide, _ := OptionalParam[string](args, "startSide")
 
 			client, err := deps.GetGQLClient(ctx)
 			if err != nil {
 				return utils.NewToolResultErrorFromErr("failed to get GitHub GQL client", err), nil, nil
 			}
 
+			var linePtr, startLinePtr *int32
+			if line != 0 {
+				l := int32(line) // #nosec G115
+				linePtr = &l
+			}
+			if startLine != 0 {
+				sl := int32(startLine) // #nosec G115
+				startLinePtr = &sl
+			}
+			var sidePtr, startSidePtr *string
+			if side != "" {
+				sidePtr = &side
+			}
+			if startSide != "" {
+				startSidePtr = &startSide
+			}
+
 			result, err := AddCommentToPendingReviewCall(ctx, client, AddCommentToPendingReviewParams{
-				Owner:       params.Owner,
-				Repo:        params.Repo,
-				PullNumber:  params.PullNumber,
-				Path:        params.Path,
-				Body:        params.Body,
-				SubjectType: params.SubjectType,
-				Line:        params.Line,
-				Side:        params.Side,
-				StartLine:   params.StartLine,
-				StartSide:   params.StartSide,
+				Owner:       owner,
+				Repo:        repo,
+				PullNumber:  int32(pullNumber), // #nosec G115 - PR numbers are always small positive integers
+				Path:        path,
+				Body:        body,
+				SubjectType: subjectType,
+				Line:        linePtr,
+				Side:        sidePtr,
+				StartLine:   startLinePtr,
+				StartSide:   startSidePtr,
 			})
 			return result, nil, err
 		})

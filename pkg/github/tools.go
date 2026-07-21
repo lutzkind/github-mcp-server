@@ -5,10 +5,11 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/google/go-github/v89/github"
+	"github.com/shurcooL/githubv4"
+
 	"github.com/github/github-mcp-server/pkg/inventory"
 	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/google/go-github/v87/github"
-	"github.com/shurcooL/githubv4"
 )
 
 type GetClientFn func(context.Context) (*github.Client, error)
@@ -75,6 +76,11 @@ var (
 		ID:          "actions",
 		Description: "GitHub Actions workflows and CI/CD operations",
 		Icon:        "workflow",
+	}
+	ToolsetMetadataCodeQuality = inventory.ToolsetMetadata{
+		ID:          "code_quality",
+		Description: "GitHub Code Quality related tools",
+		Icon:        "code-square",
 	}
 	ToolsetMetadataCodeSecurity = inventory.ToolsetMetadata{
 		ID:          "code_security",
@@ -176,8 +182,11 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		// Repository tools
 		SearchRepositories(t),
 		GetFileContents(t),
+		LegacyGetFileContents(t),
 		ListCommits(t),
+		LegacyListCommits(t),
 		SearchCode(t),
+		LegacySearchCode(t),
 		SearchCommits(t),
 		GetCommit(t),
 		GetFileBlame(t),
@@ -186,6 +195,7 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		ListTags(t),
 		GetTag(t),
 		ListReleases(t),
+		LegacyListReleases(t),
 		GetLatestRelease(t),
 		GetReleaseByTag(t),
 		CreateOrUpdateFile(t),
@@ -208,14 +218,16 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		// Issue tools
 		IssueRead(t),
 		SearchIssues(t),
+		LegacySearchIssues(t),
 		ListIssues(t),
 		LegacyListIssues(t),
 		ListIssueTypes(t),
 		ListIssueFields(t),
 		IssueWrite(t),
-		LegacyIssueWrite(t),
 		AddIssueComment(t),
 		SubIssueWrite(t),
+		IssueDependencyRead(t),
+		IssueDependencyWrite(t),
 
 		// User tools
 		SearchUsers(t),
@@ -226,7 +238,9 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		// Pull request tools
 		PullRequestRead(t),
 		ListPullRequests(t),
+		LegacyListPullRequests(t),
 		SearchPullRequests(t),
+		LegacySearchPullRequests(t),
 		MergePullRequest(t),
 		UpdatePullRequestBranch(t),
 		CreatePullRequest(t),
@@ -238,6 +252,9 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		// Copilot tools
 		AssignCopilotToIssue(t),
 		RequestCopilotReview(t),
+
+		// Code quality tools
+		GetCodeQualityFinding(t),
 
 		// Code security tools
 		GetCodeScanningAlert(t),
@@ -295,6 +312,9 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		ListLabels(t),
 		LabelWrite(t),
 
+		// UI tools (insiders only)
+		UIGet(t),
+
 		// Granular issue tools (feature-flagged, replace consolidated issue_write/sub_issue_write)
 		GranularCreateIssue(t),
 		GranularUpdateIssueTitle(t),
@@ -308,6 +328,8 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		GranularRemoveSubIssue(t),
 		GranularReprioritizeSubIssue(t),
 		GranularSetIssueFields(t),
+		GranularAddIssueReaction(t),
+		GranularAddIssueCommentReaction(t),
 
 		// Granular pull request tools (feature-flagged, replace consolidated update_pull_request/pull_request_review_write)
 		GranularUpdatePullRequestTitle(t),
@@ -321,6 +343,7 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		GranularAddPullRequestReviewComment(t),
 		GranularResolveReviewThread(t),
 		GranularUnresolveReviewThread(t),
+		GranularAddPullRequestReviewCommentReaction(t),
 	})
 }
 
