@@ -170,6 +170,7 @@ func Test_UpdatePullRequest(t *testing.T) {
 		Draft:               github.Ptr(false),
 		Base: &github.PullRequestBranch{
 			Ref: github.Ptr("develop"),
+			Repo: &github.Repository{FullName: github.Ptr("owner/repo")},
 		},
 	}
 
@@ -177,6 +178,7 @@ func Test_UpdatePullRequest(t *testing.T) {
 		Number: github.Ptr(42),
 		Title:  github.Ptr("Test PR"),
 		State:  github.Ptr("closed"), // State updated
+		Base:   &github.PullRequestBranch{Repo: &github.Repository{FullName: github.Ptr("owner/repo")}},
 	}
 
 	// Mock PR for when there are no updates but we still need a response
@@ -188,6 +190,7 @@ func Test_UpdatePullRequest(t *testing.T) {
 			{Login: github.Ptr("reviewer1")},
 			{Login: github.Ptr("reviewer2")},
 		},
+		Base: &github.PullRequestBranch{Repo: &github.Repository{FullName: github.Ptr("owner/repo")}},
 	}
 
 	tests := []struct {
@@ -397,6 +400,7 @@ func Test_UpdatePullRequest_Draft(t *testing.T) {
 		Draft:               github.Ptr(false), // Updated to ready for review
 		Base: &github.PullRequestBranch{
 			Ref: github.Ptr("main"),
+			Repo: &github.Repository{FullName: github.Ptr("owner/repo")},
 		},
 	}
 
@@ -596,7 +600,10 @@ func Test_UpdatePullRequestStateExtension(t *testing.T) {
 					w.WriteHeader(http.StatusOK)
 					_, _ = w.Write([]byte(`{"id":42,"html_url":"https://github.com/owner/repo/pull/42","state":"` + tc.finalState + `"}`))
 				},
-				GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, `{"id":42,"html_url":"https://github.com/owner/repo/pull/42","state":"`+tc.finalState+`"}`),
+				GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+					ID: github.Ptr(int64(42)), Number: github.Ptr(42), State: github.Ptr(tc.finalState), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/42"),
+					Base: &github.PullRequestBranch{Repo: &github.Repository{FullName: github.Ptr("owner/repo")}},
+				}),
 			}))
 			deps := BaseDeps{Client: restClient}
 			request := createMCPRequest(map[string]any{
@@ -634,7 +641,10 @@ func Test_UpdatePullRequestStateOnlyPreservesExistingFields(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"id":42,"html_url":"https://github.com/owner/repo/pull/42","state":"closed"}`))
 		},
-		GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, `{"id":42,"html_url":"https://github.com/owner/repo/pull/42","state":"closed"}`),
+		GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+			ID: github.Ptr(int64(42)), Number: github.Ptr(42), State: github.Ptr("closed"), HTMLURL: github.Ptr("https://github.com/owner/repo/pull/42"),
+			Base: &github.PullRequestBranch{Repo: &github.Repository{FullName: github.Ptr("owner/repo")}},
+		}),
 	}))
 	deps := BaseDeps{Client: restClient}
 	request := createMCPRequest(map[string]any{
@@ -832,6 +842,10 @@ func Test_MergePullRequest(t *testing.T) {
 				}).andThen(
 					mockResponse(t, http.StatusOK, mockMergeResult),
 				),
+				GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, &github.PullRequest{
+					Number: github.Ptr(42),
+					Base: &github.PullRequestBranch{Repo: &github.Repository{FullName: github.Ptr("owner/repo")}},
+				}),
 			}),
 			requestArgs: map[string]any{
 				"owner":          "owner",
@@ -894,12 +908,12 @@ func Test_MergePullRequest(t *testing.T) {
 			textContent := getTextResult(t, result)
 
 			// Unmarshal and verify the result
-			var returnedResult github.PullRequestMergeResult
-			err = json.Unmarshal([]byte(textContent.Text), &returnedResult)
+			var returnedResponse struct { Merge github.PullRequestMergeResult `json:"merge"` }
+			err = json.Unmarshal([]byte(textContent.Text), &returnedResponse)
 			require.NoError(t, err)
-			assert.Equal(t, *tc.expectedMergeResult.Merged, *returnedResult.Merged)
-			assert.Equal(t, *tc.expectedMergeResult.Message, *returnedResult.Message)
-			assert.Equal(t, *tc.expectedMergeResult.SHA, *returnedResult.SHA)
+			assert.Equal(t, *tc.expectedMergeResult.Merged, *returnedResponse.Merge.Merged)
+			assert.Equal(t, *tc.expectedMergeResult.Message, *returnedResponse.Merge.Message)
+			assert.Equal(t, *tc.expectedMergeResult.SHA, *returnedResponse.Merge.SHA)
 		})
 	}
 }
@@ -2560,6 +2574,7 @@ func Test_CreatePullRequest(t *testing.T) {
 		Base: &github.PullRequestBranch{
 			SHA: github.Ptr("efgh5678"),
 			Ref: github.Ptr("main"),
+			Repo: &github.Repository{FullName: github.Ptr("owner/repo")},
 		},
 		Body:                github.Ptr("This is a test PR"),
 		Draft:               github.Ptr(false),
@@ -2590,6 +2605,7 @@ func Test_CreatePullRequest(t *testing.T) {
 				}).andThen(
 					mockResponse(t, http.StatusCreated, mockPR),
 				),
+				GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, mockPR),
 			}),
 			requestArgs: map[string]any{
 				"owner":                 "owner",
@@ -2688,7 +2704,7 @@ func Test_CreatePullRequest_MCPAppsFeature_UIGate(t *testing.T) {
 		Title:   github.Ptr("Test PR"),
 		HTMLURL: github.Ptr("https://github.com/owner/repo/pull/42"),
 		Head:    &github.PullRequestBranch{SHA: github.Ptr("abc"), Ref: github.Ptr("feature")},
-		Base:    &github.PullRequestBranch{SHA: github.Ptr("def"), Ref: github.Ptr("main")},
+		Base:    &github.PullRequestBranch{SHA: github.Ptr("def"), Ref: github.Ptr("main"), Repo: &github.Repository{FullName: github.Ptr("owner/repo")}},
 		User:    &github.User{Login: github.Ptr("testuser")},
 	}
 
@@ -2696,6 +2712,7 @@ func Test_CreatePullRequest_MCPAppsFeature_UIGate(t *testing.T) {
 
 	client := mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
 		PostReposPullsByOwnerByRepo: mockResponse(t, http.StatusCreated, mockPR),
+		GetReposPullsByOwnerByRepoByPullNumber: mockResponse(t, http.StatusOK, mockPR),
 	}))
 
 	deps := BaseDeps{

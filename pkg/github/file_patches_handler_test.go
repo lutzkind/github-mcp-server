@@ -27,7 +27,10 @@ func TestCreateOrUpdateFileOneLinePatchLargeFileDryRunAndVerification(t *testing
 	after := strings.Replace(before, "target = old", "target = new", 1)
 	current := &github.RepositoryContent{Path: github.Ptr("fixture.txt"), SHA: github.Ptr("blob-old"), Type: github.Ptr("file"), Content: github.Ptr(base64.StdEncoding.EncodeToString([]byte(before))), Encoding: github.Ptr("base64")}
 	updated := &github.RepositoryContent{Path: github.Ptr("fixture.txt"), SHA: github.Ptr("blob-new"), Type: github.Ptr("file"), Content: github.Ptr(base64.StdEncoding.EncodeToString([]byte(after))), Encoding: github.Ptr("base64")}
-	commit := &github.RepositoryContentResponse{Content: updated}
+	commit := &github.RepositoryContentResponse{
+		Content: updated,
+		Commit:  github.Commit{SHA: github.Ptr("commit-new")},
+	}
 	getCount := 0
 	clientHTTP := MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
 		GetReposContentsByOwnerByRepoByPath: func(w http.ResponseWriter, _ *http.Request) {
@@ -39,6 +42,10 @@ func TestCreateOrUpdateFileOneLinePatchLargeFileDryRunAndVerification(t *testing
 			mockResponse(t, http.StatusOK, payload)(w, nil)
 		},
 		PutReposContentsByOwnerByRepoByPath: mockResponse(t, http.StatusOK, commit),
+		GetReposGitRefByOwnerByRepoByRef: mockResponse(t, http.StatusOK, &github.Reference{
+			Ref: github.Ptr("refs/heads/main"),
+			Object: &github.GitObject{SHA: github.Ptr("commit-new")},
+		}),
 	})
 	client := mustNewGHClient(t, clientHTTP)
 	deps := BaseDeps{Client: client}

@@ -4056,10 +4056,43 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 	const deleteBlobSHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 	baseHandlers := func(t *testing.T, createTreeOK bool, updateRefSeen *bool) map[string]http.HandlerFunc {
+		refReads := 0
+		commitReads := 0
+		treeReads := 0
+		verifiedEntries := map[string]map[string]any{
+			"update.txt": {"path": "update.txt", "mode": "100644", "type": "blob", "sha": oldBlobSHA},
+			"delete.txt": {"path": "delete.txt", "mode": "100644", "type": "blob", "sha": deleteBlobSHA},
+			"keep.txt":   {"path": "keep.txt", "mode": "100644", "type": "blob", "sha": "cccccccccccccccccccccccccccccccccccccccc"},
+			"dir":        {"path": "dir", "mode": "040000", "type": "tree", "sha": "dddddddddddddddddddddddddddddddddddddddd"},
+		}
+		mapsToSortedEntries := func(entries map[string]map[string]any) []map[string]any {
+			result := make([]map[string]any, 0, len(entries))
+			for _, entry := range entries { result = append(result, entry) }
+			return result
+		}
 		return map[string]http.HandlerFunc{
-			GetReposGitRefByOwnerByRepoByRef:           mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+headSHA+`"}}`),
-			GetReposGitCommitsByOwnerByRepoByCommitSHA: mockResponse(t, http.StatusOK, `{"sha":"`+headSHA+`","tree":{"sha":"`+baseTreeSHA+`"}}`),
-			GetReposGitTreesByOwnerByRepoByTree:        mockResponse(t, http.StatusOK, `{"sha":"`+baseTreeSHA+`","truncated":false,"tree":[{"path":"update.txt","mode":"100644","type":"blob","sha":"`+oldBlobSHA+`"},{"path":"delete.txt","mode":"100644","type":"blob","sha":"`+deleteBlobSHA+`"},{"path":"keep.txt","mode":"100644","type":"blob","sha":"cccccccccccccccccccccccccccccccccccccccc"},{"path":"dir","mode":"040000","type":"tree","sha":"dddddddddddddddddddddddddddddddddddddddd"}]}`),
+			GetReposGitRefByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
+				refReads++
+				sha := headSHA
+				if refReads > 1 { sha = newCommitSHA }
+				mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sha+`"}}`)(w, nil)
+			},
+			GetReposGitCommitsByOwnerByRepoByCommitSHA: func(w http.ResponseWriter, _ *http.Request) {
+				commitReads++
+				sha, tree := headSHA, baseTreeSHA
+				if commitReads > 1 { sha, tree = newCommitSHA, newTreeSHA }
+				mockResponse(t, http.StatusOK, `{"sha":"`+sha+`","tree":{"sha":"`+tree+`"},"parents":[{"sha":"`+headSHA+`"}]}`)(w, nil)
+			},
+			GetReposGitTreesByOwnerByRepoByTree: func(w http.ResponseWriter, _ *http.Request) {
+				treeReads++
+				if treeReads == 1 {
+					mockResponse(t, http.StatusOK, `{"sha":"`+baseTreeSHA+`","truncated":false,"tree":[{"path":"update.txt","mode":"100644","type":"blob","sha":"`+oldBlobSHA+`"},{"path":"delete.txt","mode":"100644","type":"blob","sha":"`+deleteBlobSHA+`"},{"path":"keep.txt","mode":"100644","type":"blob","sha":"cccccccccccccccccccccccccccccccccccccccc"},{"path":"dir","mode":"040000","type":"tree","sha":"dddddddddddddddddddddddddddddddddddddddd"}]} `)(w, nil)
+					return
+				}
+				encoded, err := json.Marshal(map[string]any{"sha": newTreeSHA, "truncated": false, "tree": mapsToSortedEntries(verifiedEntries)})
+				require.NoError(t, err)
+				mockResponse(t, http.StatusOK, json.RawMessage(encoded))(w, nil)
+			},
 			PostReposGitTreesByOwnerByRepo: func(w http.ResponseWriter, r *http.Request) {
 				if !createTreeOK {
 					w.WriteHeader(http.StatusInternalServerError)
@@ -4076,6 +4109,13 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 				}
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 				assert.Equal(t, baseTreeSHA, body.BaseTree)
+				for _, entry := range body.Tree {
+					if entry.Content == nil && entry.SHA == nil {
+						delete(verifiedEntries, entry.Path)
+						continue
+					}
+					verifiedEntries[entry.Path] = map[string]any{"path": entry.Path, "mode": "100644", "type": "blob", "sha": "generated-" + entry.Path}
+				}
 				w.WriteHeader(http.StatusCreated)
 				_, _ = w.Write([]byte(`{"sha":"` + newTreeSHA + `"}`))
 			},
