@@ -4,32 +4,75 @@
     "readOnlyHint": false,
     "title": "Create repository"
   },
-  "description": "Create a new GitHub repository in your account or specified organization",
+  "description": "Create exactly one GitHub repository for an authenticated user or organization. Dry-run by default; execute=true is required to create it. Never modifies existing repositories. Public repository creation is supported when explicitly selected.",
   "inputSchema": {
     "properties": {
-      "autoInit": {
-        "description": "Initialize with README",
-        "type": "boolean"
-      },
       "description": {
         "description": "Repository description",
+        "type": "string"
+      },
+      "execute": {
+        "default": false,
+        "description": "Perform the create operation. Defaults to false (preview only).",
+        "type": "boolean"
+      },
+      "gitignore_template": {
+        "description": "Optional GitHub gitignore template",
+        "type": "string"
+      },
+      "has_discussions": {
+        "default": true,
+        "description": "Enable discussions. Defaults to true.",
+        "type": "boolean"
+      },
+      "has_issues": {
+        "default": true,
+        "description": "Enable issues. Defaults to true.",
+        "type": "boolean"
+      },
+      "has_projects": {
+        "default": false,
+        "description": "Enable projects. Defaults to false.",
+        "type": "boolean"
+      },
+      "has_wiki": {
+        "default": false,
+        "description": "Enable the wiki. Defaults to false.",
+        "type": "boolean"
+      },
+      "homepage": {
+        "description": "Optional repository homepage URL",
+        "type": "string"
+      },
+      "initialize_with_readme": {
+        "default": false,
+        "description": "Initialize with a generated README. Defaults to false.",
+        "type": "boolean"
+      },
+      "license_template": {
+        "description": "Optional GitHub license template",
         "type": "string"
       },
       "name": {
         "description": "Repository name",
         "type": "string"
       },
-      "organization": {
-        "description": "Organization to create the repository in (omit to create in your personal account)",
+      "owner": {
+        "description": "Authenticated GitHub username or organization name",
         "type": "string"
       },
-      "private": {
-        "default": true,
-        "description": "Whether the repository should be private. Defaults to true (private) when omitted.",
-        "type": "boolean"
+      "visibility": {
+        "default": "private",
+        "description": "Repository visibility. Defaults to private.",
+        "enum": [
+          "public",
+          "private"
+        ],
+        "type": "string"
       }
     },
     "required": [
+      "owner",
       "name"
     ],
     "type": "object"

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	ghcontext "github.com/github/github-mcp-server/pkg/context"
 	ghErrors "github.com/github/github-mcp-server/pkg/errors"
 	"github.com/github/github-mcp-server/pkg/ifc"
 	"github.com/github/github-mcp-server/pkg/inventory"
@@ -1932,13 +1934,270 @@ func PushFilesFromSharedPaths(t translations.TranslationHelperFunc) inventory.Se
 	)
 }
 
-// CreateRepository creates a tool to create a new GitHub repository.
+type createRepositoryAudit struct {
+	Timestamp             string
+	AuthenticatedIdentity string
+	RequestedOwner        string
+	RepositoryName        string
+	Visibility            string
+	Mode                  string
+	Endpoint              string
+	HTTPResultCategory    string
+	VerificationResult    string
+	AuditID               string
+}
+
+type createRepositoryRequest struct {
+	Owner                string
+	Name                 string
+	Description          string
+	Visibility           string
+	InitializeWithReadme bool
+	GitignoreTemplate    string
+	LicenseTemplate      string
+	Homepage             string
+	HasIssues            bool
+	HasProjects          bool
+	HasWiki              bool
+	HasDiscussions       bool
+	Execute              bool
+}
+
+func createRepositoryTokenTypeName(ctx context.Context) string {
+	tokenInfo, ok := ghcontext.GetTokenInfo(ctx)
+	if !ok || tokenInfo == nil {
+		return "unknown"
+	}
+	switch tokenInfo.TokenType {
+	case utils.TokenTypePersonalAccessToken:
+		return "classic_pat"
+	case utils.TokenTypeFineGrainedPersonalAccessToken:
+		return "fine_grained_pat"
+	case utils.TokenTypeOAuthAccessToken:
+		return "oauth"
+	case utils.TokenTypeUserToServerGitHubAppToken:
+		return "github_app_user_token"
+	case utils.TokenTypeServerToServerGitHubAppToken:
+		return "github_app_installation_token"
+	default:
+		return "unknown"
+	}
+}
+
+func logCreateRepositoryAudit(ctx context.Context, deps ToolDependencies, audit createRepositoryAudit) {
+	// Audit records contain only request metadata and GitHub result categories.
+	// Keep this fail-safe because lightweight unit-test dependencies may not have
+	// an observability exporter configured.
+	defer func() { _ = recover() }()
+	logger := slog.Default()
+	if dependencyLogger := deps.Logger(ctx); dependencyLogger != nil {
+		logger = dependencyLogger
+	}
+	logger.Info("github create_repository audit",
+		slog.String("timestamp", audit.Timestamp),
+		slog.String("authenticated_identity", audit.AuthenticatedIdentity),
+		slog.String("token_type", createRepositoryTokenTypeName(ctx)),
+		slog.String("requested_owner", audit.RequestedOwner),
+		slog.String("repository_name", audit.RepositoryName),
+		slog.String("visibility", audit.Visibility),
+		slog.String("mode", audit.Mode),
+		slog.String("github_api_endpoint", audit.Endpoint),
+		slog.String("http_result_category", audit.HTTPResultCategory),
+		slog.String("verification_result", audit.VerificationResult),
+		slog.String("audit_id", audit.AuditID),
+	)
+}
+
+func createRepositoryErrorResult(code, message string, base map[string]any, auditID string) *mcp.CallToolResult {
+	result := map[string]any{
+		"error":    code,
+		"message":  message,
+		"audit_id": auditID,
+	}
+	for key, value := range base {
+		result[key] = value
+	}
+	toolResult := MarshalledTextResult(result)
+	toolResult.IsError = true
+	return toolResult
+}
+
+func repositoryVisibility(repo *github.Repository) string {
+	if visibility := strings.ToLower(repo.GetVisibility()); visibility != "" {
+		return visibility
+	}
+	if repo.GetPrivate() {
+		return "private"
+	}
+	return "public"
+}
+
+func repositoryDefaultBranch(repo *github.Repository) any {
+	if branch := repo.GetDefaultBranch(); branch != "" {
+		return branch
+	}
+	return nil
+}
+
+func repositoryResponse(repo *github.Repository) map[string]any {
+	return map[string]any{
+		"id":        fmt.Sprintf("%d", repo.GetID()),
+		"full_name": repo.GetFullName(),
+		"owner":     repo.GetOwner().GetLogin(),
+		"name":      repo.GetName(),
+		"html_url":  repo.GetHTMLURL(),
+		"clone_urls": map[string]any{
+			"https": repo.GetCloneURL(),
+			"ssh":   repo.GetSSHURL(),
+			"git":   repo.GetGitURL(),
+		},
+		"visibility":     repositoryVisibility(repo),
+		"description":    repo.GetDescription(),
+		"default_branch": repositoryDefaultBranch(repo),
+	}
+}
+
+func createRepositorySettings(repo *github.Repository) map[string]any {
+	return map[string]any{
+		"homepage":        repo.GetHomepage(),
+		"has_issues":      repo.GetHasIssues(),
+		"has_projects":    repo.GetHasProjects(),
+		"has_wiki":        repo.GetHasWiki(),
+		"has_discussions": repo.GetHasDiscussions(),
+	}
+}
+
+func createRepositoryRequestedPayload(request createRepositoryRequest) map[string]any {
+	return map[string]any{
+		"owner":                  request.Owner,
+		"name":                   request.Name,
+		"description":            request.Description,
+		"visibility":             request.Visibility,
+		"initialize_with_readme": request.InitializeWithReadme,
+		"gitignore_template":     request.GitignoreTemplate,
+		"license_template":       request.LicenseTemplate,
+		"homepage":               request.Homepage,
+		"has_issues":             request.HasIssues,
+		"has_projects":           request.HasProjects,
+		"has_wiki":               request.HasWiki,
+		"has_discussions":        request.HasDiscussions,
+		"execute":                request.Execute,
+	}
+}
+
+func createRepositoryPreviewBase(request createRepositoryRequest, identity map[string]any, endpoint string, existing, mayCreate bool, validationErrors []string, auditID string) map[string]any {
+	return map[string]any{
+		"authenticated_identity": identity,
+		"requested_owner":        request.Owner,
+		"repository_name":        request.Name,
+		"visibility":             request.Visibility,
+		"description":            request.Description,
+		"initialization_options": map[string]any{
+			"initialize_with_readme": request.InitializeWithReadme,
+			"gitignore_template":     request.GitignoreTemplate,
+			"license_template":       request.LicenseTemplate,
+		},
+		"requested_settings": map[string]any{
+			"homepage":        request.Homepage,
+			"has_issues":      request.HasIssues,
+			"has_projects":    request.HasProjects,
+			"has_wiki":        request.HasWiki,
+			"has_discussions": request.HasDiscussions,
+		},
+		"api_operation":             endpoint,
+		"repository_already_exists": existing,
+		"may_create_repositories":   mayCreate,
+		"validation_errors":         validationErrors,
+		"changed":                   false,
+		"preview_only":              !request.Execute,
+		"audit_id":                  auditID,
+	}
+}
+
+func organizationMayCreateRepository(org *github.Organization, membership *github.Membership, visibility string, appToken bool) bool {
+	if appToken {
+		// Installation tokens have no user membership endpoint. The organization
+		// endpoint is the available preflight signal; GitHub remains authoritative
+		// for the final administration permission on POST.
+		return org != nil
+	}
+	if membership == nil || membership.GetState() != "active" {
+		return false
+	}
+	if membership.GetRole() == "admin" {
+		return true
+	}
+	if org.GetMembersCanCreateRepos() {
+		if visibility == "public" && org.MembersCanCreatePublicRepos != nil {
+			return org.GetMembersCanCreatePublicRepos()
+		}
+		if visibility == "private" && org.MembersCanCreatePrivateRepos != nil {
+			return org.GetMembersCanCreatePrivateRepos()
+		}
+		return true
+	}
+	if visibility == "public" && org.MembersCanCreatePublicRepos != nil {
+		return org.GetMembersCanCreatePublicRepos()
+	}
+	if visibility == "private" && org.MembersCanCreatePrivateRepos != nil {
+		return org.GetMembersCanCreatePrivateRepos()
+	}
+	switch strings.ToLower(org.GetMembersAllowedRepositoryCreationType()) {
+	case "all":
+		return true
+	case "private":
+		return visibility == "private"
+	default:
+		return false
+	}
+}
+
+func createRepositoryMatches(repo *github.Repository, owner, name string) bool {
+	return strings.EqualFold(repo.GetName(), name) &&
+		strings.EqualFold(repo.GetOwner().GetLogin(), owner) &&
+		strings.EqualFold(repo.GetFullName(), owner+"/"+name)
+}
+
+func verifyCreatedRepository(repo *github.Repository, request createRepositoryRequest, owner string) []string {
+	var failures []string
+	if !createRepositoryMatches(repo, owner, request.Name) {
+		failures = append(failures, "full_name_owner_or_name_mismatch")
+	}
+	if repositoryVisibility(repo) != request.Visibility {
+		failures = append(failures, "visibility_mismatch")
+	}
+	if repo.GetDescription() != request.Description {
+		failures = append(failures, "description_mismatch")
+	}
+	if repo.GetHomepage() != request.Homepage {
+		failures = append(failures, "homepage_mismatch")
+	}
+	if request.InitializeWithReadme && repo.GetDefaultBranch() == "" {
+		failures = append(failures, "default_branch_missing_for_initialized_repository")
+	}
+	settings := createRepositorySettings(repo)
+	requestedSettings := map[string]bool{
+		"has_issues":      request.HasIssues,
+		"has_projects":    request.HasProjects,
+		"has_wiki":        request.HasWiki,
+		"has_discussions": request.HasDiscussions,
+	}
+	for key, expected := range requestedSettings {
+		if settings[key] != expected {
+			failures = append(failures, key+"_mismatch")
+		}
+	}
+	return failures
+}
+
+// CreateRepository creates exactly one repository, previewing by default. It
+// never modifies an existing repository and performs one POST at most.
 func CreateRepository(t translations.TranslationHelperFunc) inventory.ServerTool {
 	return NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
 			Name:        "create_repository",
-			Description: t("TOOL_CREATE_REPOSITORY_DESCRIPTION", "Create a new GitHub repository in your account or specified organization"),
+			Description: t("TOOL_CREATE_REPOSITORY_DESCRIPTION", "Create exactly one GitHub repository for an authenticated user or organization. Dry-run by default; execute=true is required to create it. Never modifies existing repositories. Public repository creation is supported when explicitly selected."),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_CREATE_REPOSITORY_USER_TITLE", "Create repository"),
 				ReadOnlyHint: false,
@@ -1946,6 +2205,10 @@ func CreateRepository(t translations.TranslationHelperFunc) inventory.ServerTool
 			InputSchema: &jsonschema.Schema{
 				Type: "object",
 				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Authenticated GitHub username or organization name",
+					},
 					"name": {
 						Type:        "string",
 						Description: "Repository name",
@@ -1954,87 +2217,304 @@ func CreateRepository(t translations.TranslationHelperFunc) inventory.ServerTool
 						Type:        "string",
 						Description: "Repository description",
 					},
-					"organization": {
+					"visibility": {
 						Type:        "string",
-						Description: "Organization to create the repository in (omit to create in your personal account)",
+						Enum:        []any{"public", "private"},
+						Description: "Repository visibility. Defaults to private.",
+						Default:     json.RawMessage(`"private"`),
 					},
-					"private": {
+					"initialize_with_readme": {
 						Type:        "boolean",
-						Description: "Whether the repository should be private. Defaults to true (private) when omitted.",
-						Default:     json.RawMessage("true"),
+						Description: "Initialize with a generated README. Defaults to false.",
+						Default:     json.RawMessage("false"),
 					},
-					"autoInit": {
-						Type:        "boolean",
-						Description: "Initialize with README",
+					"gitignore_template": {Type: "string", Description: "Optional GitHub gitignore template"},
+					"license_template":   {Type: "string", Description: "Optional GitHub license template"},
+					"homepage":           {Type: "string", Description: "Optional repository homepage URL"},
+					"has_issues": {
+						Type: "boolean", Description: "Enable issues. Defaults to true.", Default: json.RawMessage("true"),
+					},
+					"has_projects": {
+						Type: "boolean", Description: "Enable projects. Defaults to false.", Default: json.RawMessage("false"),
+					},
+					"has_wiki": {
+						Type: "boolean", Description: "Enable the wiki. Defaults to false.", Default: json.RawMessage("false"),
+					},
+					"has_discussions": {
+						Type: "boolean", Description: "Enable discussions. Defaults to true.", Default: json.RawMessage("true"),
+					},
+					"execute": {
+						Type: "boolean", Description: "Perform the create operation. Defaults to false (preview only).", Default: json.RawMessage("false"),
 					},
 				},
-				Required: []string{"name"},
+				Required: []string{"owner", "name"},
 			},
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			audit := createRepositoryAudit{
+				Timestamp:          time.Now().UTC().Format(time.RFC3339Nano),
+				Mode:               "preview",
+				Endpoint:           "not_selected",
+				HTTPResultCategory: "not_attempted",
+				VerificationResult: "not_attempted",
+				AuditID:            mutationRequestID(),
+			}
+			defer func() { logCreateRepositoryAudit(ctx, deps, audit) }()
+
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return createRepositoryErrorResult("invalid_repository_name", "owner is required", map[string]any{"validation_errors": []string{"owner_required"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
 			name, err := RequiredParam[string](args, "name")
 			if err != nil {
-				return utils.NewToolResultError(err.Error()), nil, nil
+				return createRepositoryErrorResult("invalid_repository_name", "repository name is required", map[string]any{"validation_errors": []string{"name_required"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
 			}
-			description, err := OptionalParam[string](args, "description")
-			if err != nil {
-				return utils.NewToolResultError(err.Error()), nil, nil
-			}
-			organization, err := OptionalParam[string](args, "organization")
-			if err != nil {
-				return utils.NewToolResultError(err.Error()), nil, nil
-			}
-			private, err := OptionalBoolParamWithDefault(args, "private", true)
-			if err != nil {
-				return utils.NewToolResultError(err.Error()), nil, nil
-			}
-			autoInit, err := OptionalParam[bool](args, "autoInit")
-			if err != nil {
-				return utils.NewToolResultError(err.Error()), nil, nil
+			audit.RequestedOwner, audit.RepositoryName = owner, name
+			if name == "." || name == ".." || !regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`).MatchString(name) {
+				return createRepositoryErrorResult("invalid_repository_name", "repository name must contain 1-100 letters, numbers, '.', '_' or '-' and cannot be '.' or '..'", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"invalid_repository_name"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
 			}
 
-			repo := &github.Repository{
-				Name:        github.Ptr(name),
-				Description: github.Ptr(description),
-				Private:     github.Ptr(private),
-				AutoInit:    github.Ptr(autoInit),
+			description, err := OptionalParam[string](args, "description")
+			if err != nil {
+				return createRepositoryErrorResult("invalid_repository_name", "description must be a string", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"description_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
 			}
+			visibility, err := OptionalParam[string](args, "visibility")
+			if err != nil {
+				return createRepositoryErrorResult("visibility_not_allowed", "visibility must be public or private", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"visibility_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			if visibility == "" {
+				visibility = "private"
+			}
+			visibility = strings.ToLower(visibility)
+			audit.Visibility = visibility
+			if visibility != "public" && visibility != "private" {
+				return createRepositoryErrorResult("visibility_not_allowed", "visibility must be public or private", map[string]any{"requested_owner": owner, "repository_name": name, "visibility": visibility, "validation_errors": []string{"visibility_not_allowed"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			initializeWithReadme, err := OptionalBoolParamWithDefault(args, "initialize_with_readme", false)
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "initialize_with_readme must be a boolean", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"initialize_with_readme_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			gitignoreTemplate, err := OptionalParam[string](args, "gitignore_template")
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "gitignore_template must be a string", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"gitignore_template_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			licenseTemplate, err := OptionalParam[string](args, "license_template")
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "license_template must be a string", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"license_template_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			homepage, err := OptionalParam[string](args, "homepage")
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "homepage must be a string", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"homepage_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			hasIssues, err := OptionalBoolParamWithDefault(args, "has_issues", true)
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "has_issues must be a boolean", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"has_issues_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			hasProjects, err := OptionalBoolParamWithDefault(args, "has_projects", false)
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "has_projects must be a boolean", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"has_projects_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			hasWiki, err := OptionalBoolParamWithDefault(args, "has_wiki", false)
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "has_wiki must be a boolean", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"has_wiki_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			hasDiscussions, err := OptionalBoolParamWithDefault(args, "has_discussions", true)
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "has_discussions must be a boolean", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"has_discussions_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			execute, err := OptionalBoolParamWithDefault(args, "execute", false)
+			if err != nil {
+				return createRepositoryErrorResult("github_api_error", "execute must be a boolean", map[string]any{"requested_owner": owner, "repository_name": name, "validation_errors": []string{"execute_type"}, "changed": false, "preview_only": true}, audit.AuditID), nil, nil
+			}
+			request := createRepositoryRequest{Owner: owner, Name: name, Description: description, Visibility: visibility, InitializeWithReadme: initializeWithReadme, GitignoreTemplate: gitignoreTemplate, LicenseTemplate: licenseTemplate, Homepage: homepage, HasIssues: hasIssues, HasProjects: hasProjects, HasWiki: hasWiki, HasDiscussions: hasDiscussions, Execute: execute}
+			audit.Mode = map[bool]string{true: "execution", false: "preview"}[execute]
 
 			client, err := deps.GetClient(ctx)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
-			}
-			createdRepo, resp, err := client.Repositories.Create(ctx, organization, repo)
-			if err != nil {
-				return ghErrors.NewGitHubAPIErrorResponse(ctx,
-					"failed to create repository",
-					resp,
-					err,
-				), nil, nil
-			}
-			defer func() { _ = resp.Body.Close() }()
-
-			if resp.StatusCode != http.StatusCreated {
-				body, err := io.ReadAll(resp.Body)
-				if err != nil {
-					return nil, nil, fmt.Errorf("failed to read response body: %w", err)
+				code := "github_api_error"
+				message := "failed to obtain an authenticated GitHub client"
+				if strings.Contains(strings.ToLower(err.Error()), "no token info") {
+					code = "authentication_missing"
+					message = "GitHub authentication is required"
 				}
-				return ghErrors.NewGitHubAPIStatusErrorResponse(ctx, "failed to create repository", resp, body), nil, nil
+				return createRepositoryErrorResult(code, message, map[string]any{"requested": createRepositoryRequestedPayload(request), "validation_errors": []string{code}, "changed": false, "preview_only": !execute}, audit.AuditID), nil, nil
+			}
+			if client == nil {
+				return createRepositoryErrorResult("authentication_missing", "GitHub authentication is required", map[string]any{"requested": createRepositoryRequestedPayload(request), "validation_errors": []string{"authentication_missing"}, "changed": false, "preview_only": !execute}, audit.AuditID), nil, nil
 			}
 
-			// Return minimal response with just essential information
-			minimalResponse := MinimalResponse{
-				ID:  fmt.Sprintf("%d", createdRepo.GetID()),
-				URL: createdRepo.GetHTMLURL(),
-			}
-
-			r, err := json.Marshal(minimalResponse)
+			identity := map[string]any{"login": nil, "type": createRepositoryTokenTypeName(ctx), "resolved": false}
+			authenticatedUser, resp, err := client.Users.Get(ctx, "")
+			closeResponse(resp)
+			appInstallationToken := createRepositoryTokenTypeName(ctx) == "github_app_installation_token"
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
+				if appInstallationToken {
+					identity["login"] = "github_app_installation"
+					identity["resolved"] = true
+					audit.AuthenticatedIdentity = "github_app_installation"
+				} else {
+					status := 0
+					if resp != nil {
+						status = resp.StatusCode
+					}
+					code, message := "github_api_error", "failed to resolve authenticated GitHub identity"
+					if status == http.StatusUnauthorized {
+						code, message = "authentication_missing", "GitHub authentication is missing or invalid"
+					} else if status == http.StatusForbidden {
+						code, message = "insufficient_scope", "GitHub identity lookup requires user/read permission"
+					}
+					return createRepositoryErrorResult(code, message, map[string]any{"requested": createRepositoryRequestedPayload(request), "validation_errors": []string{code}, "changed": false, "preview_only": !execute}, audit.AuditID), nil, nil
+				}
+			} else {
+				login := authenticatedUser.GetLogin()
+				if login == "" {
+					return createRepositoryErrorResult("authentication_missing", "GitHub did not return an authenticated identity", map[string]any{"requested": createRepositoryRequestedPayload(request), "validation_errors": []string{"authentication_missing"}, "changed": false, "preview_only": !execute}, audit.AuditID), nil, nil
+				}
+				identity["login"], identity["type"], identity["resolved"] = login, "user", true
+				audit.AuthenticatedIdentity = login
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			endpoint := ""
+			mayCreate := false
+			var membership *github.Membership
+			if login, _ := identity["login"].(string); strings.EqualFold(login, owner) {
+				endpoint = "/user/repos"
+				mayCreate = true
+			} else {
+				org, orgResp, orgErr := client.Organizations.Get(ctx, owner)
+				closeResponse(orgResp)
+				if orgErr != nil {
+					status := 0
+					if orgResp != nil {
+						status = orgResp.StatusCode
+					}
+					code, message := "owner_not_found", "requested owner is not the authenticated user or a reachable organization"
+					if status == http.StatusForbidden {
+						code, message = "organization_access_denied", "authenticated identity cannot access the requested organization"
+					} else if status != http.StatusNotFound && status != 0 {
+						code, message = "github_api_error", "failed to resolve requested GitHub organization"
+					}
+					return createRepositoryErrorResult(code, message, map[string]any{"authenticated_identity": identity, "requested_owner": owner, "repository_name": name, "visibility": visibility, "api_operation": "/orgs/" + owner + "/repos", "validation_errors": []string{code}, "changed": false, "preview_only": !execute}, audit.AuditID), nil, nil
+				}
+				endpoint = "/orgs/" + owner + "/repos"
+				if !appInstallationToken {
+					membership, resp, err = client.Organizations.GetOrgMembership(ctx, "", owner)
+					closeResponse(resp)
+					if err != nil {
+						status := 0
+						if resp != nil {
+							status = resp.StatusCode
+						}
+						code := "organization_access_denied"
+						if status == http.StatusForbidden {
+							code = "insufficient_scope"
+						}
+						return createRepositoryErrorResult(code, "authenticated identity is not permitted to create repositories for this organization", map[string]any{"authenticated_identity": identity, "requested_owner": owner, "repository_name": name, "visibility": visibility, "api_operation": endpoint, "validation_errors": []string{code}, "changed": false, "preview_only": !execute}, audit.AuditID), nil, nil
+					}
+				}
+				mayCreate = organizationMayCreateRepository(org, membership, visibility, appInstallationToken)
+			}
+			audit.Endpoint, audit.AuthenticatedIdentity = endpoint, fmt.Sprint(identity["login"])
+
+			base := createRepositoryPreviewBase(request, identity, "POST "+endpoint, false, mayCreate, []string{}, audit.AuditID)
+			// A repository lookup is the idempotency and no-overwrite gate. A
+			// successful lookup is never followed by a write.
+			existingRepo, existingResp, existingErr := client.Repositories.Get(ctx, owner, name)
+			if existingErr == nil && existingRepo != nil {
+				closeResponse(existingResp)
+				if !createRepositoryMatches(existingRepo, owner, name) {
+					audit.HTTPResultCategory, audit.VerificationResult = "preflight_mismatch", "failed"
+					return createRepositoryErrorResult("verification_failed", "GitHub returned an existing repository that does not exactly match the requested owner and name", base, audit.AuditID), nil, nil
+				}
+				base["repository_already_exists"] = true
+				base["verified"] = true
+				base["repository"] = repositoryResponse(existingRepo)
+				base["changed"] = false
+				base["preview_only"] = !execute
+				audit.HTTPResultCategory, audit.VerificationResult = "repository_already_exists", "verified_noop"
+				return MarshalledTextResult(base), nil, nil
+			}
+			if existingResp != nil {
+				status := existingResp.StatusCode
+				closeResponse(existingResp)
+				if status != http.StatusNotFound {
+					audit.HTTPResultCategory = "preflight_repository_lookup_failed"
+					return createRepositoryErrorResult("github_api_error", "could not safely determine whether the repository already exists", base, audit.AuditID), nil, nil
+				}
+			} else if existingErr != nil {
+				audit.HTTPResultCategory = "preflight_repository_lookup_failed"
+				return createRepositoryErrorResult("github_api_error", "could not safely determine whether the repository already exists", base, audit.AuditID), nil, nil
+			}
+
+			if !mayCreate {
+				base["validation_errors"] = []string{"insufficient_scope"}
+				base["permission_requirement"] = "GitHub repository administration/repository creation permission; organization members also need organization policy permission to create this visibility"
+				audit.HTTPResultCategory, audit.VerificationResult = "permission_denied_preflight", "not_attempted"
+				return createRepositoryErrorResult("insufficient_scope", "authenticated identity may not create repositories for the requested owner", base, audit.AuditID), nil, nil
+			}
+
+			if !execute {
+				audit.HTTPResultCategory, audit.VerificationResult = "preflight_success", "not_applicable"
+				return MarshalledTextResult(base), nil, nil
+			}
+
+			repo := &github.Repository{
+				Name:              github.Ptr(name),
+				Description:       github.Ptr(description),
+				Homepage:          github.Ptr(homepage),
+				Private:           github.Ptr(visibility == "private"),
+				Visibility:        github.Ptr(visibility),
+				AutoInit:          github.Ptr(initializeWithReadme),
+				GitignoreTemplate: github.Ptr(gitignoreTemplate),
+				LicenseTemplate:   github.Ptr(licenseTemplate),
+				HasIssues:         github.Ptr(hasIssues),
+				HasProjects:       github.Ptr(hasProjects),
+				HasWiki:           github.Ptr(hasWiki),
+				HasDiscussions:    github.Ptr(hasDiscussions),
+			}
+			organization := ""
+			if endpoint != "/user/repos" {
+				organization = owner
+			}
+			createdRepo, createResp, createErr := client.Repositories.Create(ctx, organization, repo)
+			if createErr != nil {
+				audit.HTTPResultCategory, audit.VerificationResult = "api_error_no_retry", "not_attempted"
+				return createRepositoryErrorResult("github_api_error", "GitHub repository creation failed; no automatic retry was attempted", base, audit.AuditID), nil, nil
+			}
+			if createResp != nil {
+				status := createResp.StatusCode
+				closeResponse(createResp)
+				if status != http.StatusCreated {
+					audit.HTTPResultCategory, audit.VerificationResult = "api_error_no_retry", "not_attempted"
+					return createRepositoryErrorResult("github_api_error", "GitHub repository creation returned an unexpected status; no automatic retry was attempted", base, audit.AuditID), nil, nil
+				}
+			}
+			if createdRepo == nil {
+				audit.HTTPResultCategory, audit.VerificationResult = "api_success_empty_body", "failed"
+				return createRepositoryErrorResult("verification_failed", "GitHub reported creation success without a repository response", base, audit.AuditID), nil, nil
+			}
+			verifiedRepo, verifyResp, verifyErr := client.Repositories.Get(ctx, owner, name)
+			if verifyErr != nil || verifiedRepo == nil {
+				closeResponse(verifyResp)
+				audit.HTTPResultCategory, audit.VerificationResult = "created_but_fetch_failed", "failed"
+				return createRepositoryErrorResult("verification_failed", "GitHub accepted repository creation but the repository could not be fetched for verification", base, audit.AuditID), nil, nil
+			}
+			closeResponse(verifyResp)
+			failures := verifyCreatedRepository(verifiedRepo, request, owner)
+			if len(failures) > 0 {
+				audit.HTTPResultCategory, audit.VerificationResult = "created", "failed"
+				base["verification_errors"] = failures
+				return createRepositoryErrorResult("verification_failed", "GitHub created the repository but verification did not match the requested state", base, audit.AuditID), nil, nil
+			}
+			audit.HTTPResultCategory, audit.VerificationResult = "created", "verified"
+			base["changed"] = true
+			base["preview_only"] = false
+			base["verified"] = true
+			base["repository"] = repositoryResponse(verifiedRepo)
+			base["applied_settings"] = createRepositorySettings(verifiedRepo)
+			base["audit_id"] = audit.AuditID
+			return MarshalledTextResult(base), nil, nil
 		},
 	)
 }

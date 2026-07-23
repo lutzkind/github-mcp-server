@@ -14,6 +14,7 @@ import (
 
 	"github.com/github/github-mcp-server/internal/githubv4mock"
 	"github.com/github/github-mcp-server/internal/toolsnaps"
+	ghcontext "github.com/github/github-mcp-server/pkg/context"
 	"github.com/github/github-mcp-server/pkg/raw"
 	"github.com/github/github-mcp-server/pkg/translations"
 	"github.com/github/github-mcp-server/pkg/utils"
@@ -2332,7 +2333,6 @@ func Test_PushFilesFromSharedPaths(t *testing.T) {
 }
 
 func Test_CreateRepository(t *testing.T) {
-	// Verify tool definition once
 	serverTool := CreateRepository(translations.NullTranslationHelper)
 	tool := serverTool.Tool
 	require.NoError(t, toolsnaps.Test(tool.Name, tool))
@@ -2342,183 +2342,192 @@ func Test_CreateRepository(t *testing.T) {
 
 	assert.Equal(t, "create_repository", tool.Name)
 	assert.NotEmpty(t, tool.Description)
+	assert.Contains(t, schema.Properties, "owner")
 	assert.Contains(t, schema.Properties, "name")
 	assert.Contains(t, schema.Properties, "description")
-	assert.Contains(t, schema.Properties, "organization")
-	assert.Contains(t, schema.Properties, "private")
-	assert.Contains(t, schema.Properties, "autoInit")
-	assert.ElementsMatch(t, schema.Required, []string{"name"})
+	assert.Contains(t, schema.Properties, "visibility")
+	assert.Contains(t, schema.Properties, "initialize_with_readme")
+	assert.Contains(t, schema.Properties, "execute")
+	assert.ElementsMatch(t, schema.Required, []string{"owner", "name"})
 
-	// Setup mock repository response
-	mockRepo := &github.Repository{
-		Name:        github.Ptr("test-repo"),
-		Description: github.Ptr("Test repository"),
-		Private:     github.Ptr(true),
-		HTMLURL:     github.Ptr("https://github.com/testuser/test-repo"),
-		CreatedAt:   &github.Timestamp{Time: time.Now()},
-		Owner: &github.User{
-			Login: github.Ptr("testuser"),
-		},
-	}
-
-	tests := []struct {
-		name           string
-		mockedClient   *http.Client
-		requestArgs    map[string]any
-		expectError    bool
-		expectedRepo   *github.Repository
-		expectedErrMsg string
-	}{
-		{
-			name: "successful repository creation with all parameters",
-			mockedClient: NewMockedHTTPClient(
-				WithRequestMatchHandler(
-					EndpointPattern("POST /user/repos"),
-					expectRequestBody(t, map[string]any{
-						"name":        "test-repo",
-						"description": "Test repository",
-						"private":     true,
-						"auto_init":   true,
-					}).andThen(
-						mockResponse(t, http.StatusCreated, mockRepo),
-					),
-				),
-			),
-			requestArgs: map[string]any{
-				"name":        "test-repo",
-				"description": "Test repository",
-				"private":     true,
-				"autoInit":    true,
-			},
-			expectError:  false,
-			expectedRepo: mockRepo,
-		},
-		{
-			name: "successful repository creation in organization",
-			mockedClient: NewMockedHTTPClient(
-				WithRequestMatchHandler(
-					EndpointPattern("POST /orgs/testorg/repos"),
-					expectRequestBody(t, map[string]any{
-						"name":        "test-repo",
-						"description": "Test repository",
-						"private":     false,
-						"auto_init":   true,
-					}).andThen(
-						mockResponse(t, http.StatusCreated, mockRepo),
-					),
-				),
-			),
-			requestArgs: map[string]any{
-				"name":         "test-repo",
-				"description":  "Test repository",
-				"organization": "testorg",
-				"private":      false,
-				"autoInit":     true,
-			},
-			expectError:  false,
-			expectedRepo: mockRepo,
-		},
-		{
-			name: "successful repository creation with minimal parameters defaults to private",
-			mockedClient: NewMockedHTTPClient(
-				WithRequestMatchHandler(
-					EndpointPattern("POST /user/repos"),
-					expectRequestBody(t, map[string]any{
-						"name":        "test-repo",
-						"auto_init":   false,
-						"description": "",
-						"private":     true,
-					}).andThen(
-						mockResponse(t, http.StatusCreated, mockRepo),
-					),
-				),
-			),
-			requestArgs: map[string]any{
-				"name": "test-repo",
-			},
-			expectError:  false,
-			expectedRepo: mockRepo,
-		},
-		{
-			name: "successful public repository creation when private is explicitly false",
-			mockedClient: NewMockedHTTPClient(
-				WithRequestMatchHandler(
-					EndpointPattern("POST /user/repos"),
-					expectRequestBody(t, map[string]any{
-						"name":        "test-repo",
-						"auto_init":   false,
-						"description": "",
-						"private":     false,
-					}).andThen(
-						mockResponse(t, http.StatusCreated, mockRepo),
-					),
-				),
-			),
-			requestArgs: map[string]any{
-				"name":    "test-repo",
-				"private": false,
-			},
-			expectError:  false,
-			expectedRepo: mockRepo,
-		},
-		{
-			name: "repository creation fails",
-			mockedClient: NewMockedHTTPClient(
-				WithRequestMatchHandler(
-					EndpointPattern("POST /user/repos"),
-					http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-						w.WriteHeader(http.StatusUnprocessableEntity)
-						_, _ = w.Write([]byte(`{"message": "Repository creation failed"}`))
-					}),
-				),
-			),
-			requestArgs: map[string]any{
-				"name": "invalid-repo",
-			},
-			expectError:    true,
-			expectedErrMsg: "failed to create repository",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			// Setup client with mock
-			client := mustNewGHClient(t, tc.mockedClient)
-			deps := BaseDeps{
-				Client: client,
+	userResponse := `{"login":"alice","type":"User"}`
+	missingRepo := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	lookupSequence := func(handlers ...http.HandlerFunc) http.HandlerFunc {
+		index := 0
+		return func(w http.ResponseWriter, r *http.Request) {
+			current := handlers[index]
+			if index < len(handlers)-1 {
+				index++
 			}
-			handler := serverTool.Handler(deps)
-
-			// Create call request
-			request := createMCPRequest(tc.requestArgs)
-
-			// Call handler
-			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
-
-			// Verify results
-			if tc.expectError {
-				require.NoError(t, err)
-				require.True(t, result.IsError)
-				errorContent := getErrorResult(t, result)
-				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
-				return
-			}
-
-			require.NoError(t, err)
-			require.False(t, result.IsError)
-
-			// Parse the result and get the text content if no error
-			textContent := getTextResult(t, result)
-
-			// Unmarshal and verify the minimal result
-			var returnedRepo MinimalResponse
-			err = json.Unmarshal([]byte(textContent.Text), &returnedRepo)
-			assert.NoError(t, err)
-
-			// Verify repository details
-			assert.Equal(t, tc.expectedRepo.GetHTMLURL(), returnedRepo.URL)
-		})
+			current(w, r)
+		}
 	}
+	repo := func(name, owner, visibility, description string, defaultBranch string) *github.Repository {
+		return &github.Repository{
+			ID: github.Ptr(int64(123)), Name: github.Ptr(name), FullName: github.Ptr(owner + "/" + name),
+			Description: github.Ptr(description), Visibility: github.Ptr(visibility), Private: github.Ptr(visibility == "private"),
+			Owner: github.Ptr(github.User{Login: github.Ptr(owner)}), HTMLURL: github.Ptr("https://github.com/" + owner + "/" + name),
+			CloneURL: github.Ptr("https://github.com/" + owner + "/" + name + ".git"), SSHURL: github.Ptr("git@github.com:" + owner + "/" + name + ".git"),
+			GitURL: github.Ptr("git://github.com/" + owner + "/" + name + ".git"), DefaultBranch: github.Ptr(defaultBranch),
+			HasIssues: github.Ptr(true), HasProjects: github.Ptr(false), HasWiki: github.Ptr(false), HasDiscussions: github.Ptr(true),
+		}
+	}
+
+	call := func(t *testing.T, client *http.Client, args map[string]any) (*mcp.CallToolResult, string) {
+		deps := BaseDeps{Client: mustNewGHClient(t, client)}
+		request := createMCPRequest(args)
+		handler := serverTool.Handler(deps)
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		content := getTextResult(t, result)
+		return result, content.Text
+	}
+	previewArgs := map[string]any{"owner": "alice", "name": "public-repo", "description": "A public repo", "visibility": "public", "initialize_with_readme": false, "has_issues": true, "has_projects": false, "has_wiki": false, "has_discussions": true, "execute": false}
+
+	t.Run("preview for public user-owned repository", func(t *testing.T) {
+		client := NewMockedHTTPClient(
+			WithRequestMatchHandler(EndpointPattern("GET /user"), mockResponse(t, http.StatusOK, userResponse)),
+			WithRequestMatchHandler(EndpointPattern("GET /repos/alice/public-repo"), missingRepo),
+		)
+		result, text := call(t, client, previewArgs)
+		require.False(t, result.IsError)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(text), &payload))
+		assert.Equal(t, false, payload["changed"])
+		assert.Equal(t, true, payload["preview_only"])
+		assert.Equal(t, "POST /user/repos", payload["api_operation"])
+		assert.Equal(t, false, payload["repository_already_exists"])
+		assert.Equal(t, true, payload["may_create_repositories"])
+		assert.Empty(t, payload["validation_errors"])
+	})
+
+	t.Run("preview defaults to private", func(t *testing.T) {
+		client := NewMockedHTTPClient(
+			WithRequestMatchHandler(EndpointPattern("GET /user"), mockResponse(t, http.StatusOK, userResponse)),
+			WithRequestMatchHandler(EndpointPattern("GET /repos/alice/private-repo"), missingRepo),
+		)
+		_, text := call(t, client, map[string]any{"owner": "alice", "name": "private-repo"})
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(text), &payload))
+		assert.Equal(t, "private", payload["visibility"])
+		assert.Equal(t, true, payload["preview_only"])
+	})
+
+	t.Run("successful public user-owned repository creation", func(t *testing.T) {
+		created := repo("public-repo", "alice", "public", "A public repo", "")
+		client := NewMockedHTTPClient(
+			WithRequestMatchHandler(EndpointPattern("GET /user"), mockResponse(t, http.StatusOK, userResponse)),
+			WithRequestMatchHandler(EndpointPattern("GET /repos/alice/public-repo"), lookupSequence(missingRepo, mockResponse(t, http.StatusOK, created))),
+			WithRequestMatchHandler(EndpointPattern("POST /user/repos"), expectRequestBody(t, map[string]any{
+				"name": "public-repo", "description": "A public repo", "homepage": "", "private": false, "visibility": "public", "auto_init": false,
+				"gitignore_template": "", "license_template": "", "has_issues": true, "has_projects": false, "has_wiki": false, "has_discussions": true,
+			}).andThen(mockResponse(t, http.StatusCreated, created))),
+		)
+		result, text := call(t, client, map[string]any{"owner": "alice", "name": "public-repo", "description": "A public repo", "visibility": "public", "execute": true})
+		require.False(t, result.IsError)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(text), &payload))
+		assert.Equal(t, true, payload["changed"])
+		assert.Equal(t, true, payload["verified"])
+		assert.Equal(t, false, payload["preview_only"])
+		assert.Equal(t, "public", payload["visibility"])
+		assert.NotEmpty(t, payload["audit_id"])
+	})
+
+	t.Run("successful organization repository creation", func(t *testing.T) {
+		created := repo("org-repo", "acme", "private", "Org repo", "")
+		client := NewMockedHTTPClient(
+			WithRequestMatchHandler(EndpointPattern("GET /user"), mockResponse(t, http.StatusOK, userResponse)),
+			WithRequestMatchHandler(EndpointPattern("GET /orgs/acme"), mockResponse(t, http.StatusOK, `{"login":"acme","members_can_create_repositories":true}`)),
+			WithRequestMatchHandler(EndpointPattern("GET /user/memberships/orgs/acme"), mockResponse(t, http.StatusOK, `{"state":"active","role":"member"}`)),
+			WithRequestMatchHandler(EndpointPattern("GET /repos/acme/org-repo"), lookupSequence(missingRepo, mockResponse(t, http.StatusOK, created))),
+			WithRequestMatchHandler(EndpointPattern("POST /orgs/acme/repos"), expectRequestBody(t, map[string]any{
+				"name": "org-repo", "description": "Org repo", "homepage": "", "private": true, "visibility": "private", "auto_init": false,
+				"gitignore_template": "", "license_template": "", "has_issues": true, "has_projects": false, "has_wiki": false, "has_discussions": true,
+			}).andThen(mockResponse(t, http.StatusCreated, created))),
+		)
+		result, text := call(t, client, map[string]any{"owner": "acme", "name": "org-repo", "description": "Org repo", "visibility": "private", "execute": true})
+		require.False(t, result.IsError)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(text), &payload))
+		assert.Equal(t, "POST /orgs/acme/repos", payload["api_operation"])
+		assert.Equal(t, true, payload["verified"])
+	})
+
+	t.Run("existing repository is a verified no-op", func(t *testing.T) {
+		existing := repo("existing", "alice", "public", "Existing", "main")
+		client := NewMockedHTTPClient(
+			WithRequestMatchHandler(EndpointPattern("GET /user"), mockResponse(t, http.StatusOK, userResponse)),
+			WithRequestMatchHandler(EndpointPattern("GET /repos/alice/existing"), mockResponse(t, http.StatusOK, existing)),
+		)
+		result, text := call(t, client, map[string]any{"owner": "alice", "name": "existing", "visibility": "private", "execute": true})
+		require.False(t, result.IsError)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(text), &payload))
+		assert.Equal(t, false, payload["changed"])
+		assert.Equal(t, true, payload["repository_already_exists"])
+		assert.Equal(t, true, payload["verified"])
+	})
+
+	t.Run("missing authentication", func(t *testing.T) {
+		deps := BaseDeps{}
+		request := createMCPRequest(map[string]any{"owner": "alice", "name": "repo"})
+		handler := serverTool.Handler(deps)
+		result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+		require.NoError(t, err)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(getTextResult(t, result).Text), &payload))
+		assert.Equal(t, "authentication_missing", payload["error"])
+	})
+
+	t.Run("insufficient organization permission", func(t *testing.T) {
+		client := NewMockedHTTPClient(
+			WithRequestMatchHandler(EndpointPattern("GET /user"), mockResponse(t, http.StatusOK, userResponse)),
+			WithRequestMatchHandler(EndpointPattern("GET /orgs/acme"), mockResponse(t, http.StatusOK, `{"login":"acme","members_can_create_repositories":false}`)),
+			WithRequestMatchHandler(EndpointPattern("GET /user/memberships/orgs/acme"), mockResponse(t, http.StatusOK, `{"state":"active","role":"member"}`)),
+			WithRequestMatchHandler(EndpointPattern("GET /repos/acme/repo"), missingRepo),
+		)
+		result, text := call(t, client, map[string]any{"owner": "acme", "name": "repo", "execute": true})
+		require.True(t, result.IsError)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(text), &payload))
+		assert.Equal(t, "insufficient_scope", payload["error"])
+		assert.Contains(t, payload["message"], "may not create")
+	})
+
+	t.Run("invalid repository name", func(t *testing.T) {
+		result, text := call(t, &http.Client{}, map[string]any{"owner": "alice", "name": "bad/name"})
+		require.True(t, result.IsError)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(text), &payload))
+		assert.Equal(t, "invalid_repository_name", payload["error"])
+	})
+
+	t.Run("success followed by failed verification", func(t *testing.T) {
+		created := repo("verify-repo", "alice", "public", "Requested", "")
+		mismatched := repo("verify-repo", "alice", "private", "Wrong", "main")
+		client := NewMockedHTTPClient(
+			WithRequestMatchHandler(EndpointPattern("GET /user"), mockResponse(t, http.StatusOK, userResponse)),
+			WithRequestMatchHandler(EndpointPattern("GET /repos/alice/verify-repo"), lookupSequence(missingRepo, mockResponse(t, http.StatusOK, mismatched))),
+			WithRequestMatchHandler(EndpointPattern("POST /user/repos"), mockResponse(t, http.StatusCreated, created)),
+		)
+		result, text := call(t, client, map[string]any{"owner": "alice", "name": "verify-repo", "description": "Requested", "visibility": "public", "execute": true})
+		require.True(t, result.IsError)
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(text), &payload))
+		assert.Equal(t, "verification_failed", payload["error"])
+		assert.NotContains(t, text, "ghp_test_secret")
+	})
+
+	t.Run("credential values are redacted", func(t *testing.T) {
+		ctx := ghcontext.WithTokenInfo(context.Background(), &ghcontext.TokenInfo{Token: "ghp_test_secret", TokenType: utils.TokenTypePersonalAccessToken})
+		deps := BaseDeps{}
+		request := createMCPRequest(map[string]any{"owner": "alice", "name": "repo"})
+		handler := serverTool.Handler(deps)
+		result, err := handler(ContextWithDeps(ctx, deps), &request)
+		require.NoError(t, err)
+		assert.NotContains(t, getTextResult(t, result).Text, "ghp_test_secret")
+	})
 }
 
 func Test_PushFiles(t *testing.T) {
@@ -4454,7 +4463,7 @@ func Test_GetReleaseByTag(t *testing.T) {
 		Body:    github.Ptr("This is the first stable release."),
 		Assets: []*github.ReleaseAsset{
 			{
-					ID:   github.Ptr(int64(1)),
+				ID:   github.Ptr(int64(1)),
 				Name: github.Ptr("release-v1.0.0.tar.gz"),
 			},
 		},
