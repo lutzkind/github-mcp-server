@@ -4433,6 +4433,8 @@ func TestAddIssueComment(t *testing.T) {
 		IssueURL: github.Ptr("https://api.github.com/repos/owner/repo/issues/42"),
 	}
 	commentCreatedAfterReactionFailure := &atomic.Bool{}
+	issueUpdatedDuringComment := &atomic.Bool{}
+	commentRequestValidated := &atomic.Bool{}
 
 	tests := []struct {
 		name               string
@@ -4441,11 +4443,24 @@ func TestAddIssueComment(t *testing.T) {
 		expectToolError    bool
 		expectedToolErrMsg string
 		unexpectedCall     *atomic.Bool
+		expectedCall       *atomic.Bool
 	}{
 		{
-			name: "successful comment on issue",
+			name: "successful comment on issue without updating issue metadata",
 			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
-				PostReposIssuesCommentsByOwnerByRepoByIssueNumber: mockResponse(t, http.StatusCreated, mockComment),
+				PostReposIssuesCommentsByOwnerByRepoByIssueNumber: func(w http.ResponseWriter, r *http.Request) {
+					var payload map[string]any
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+					assert.Equal(t, map[string]any{"body": "This is a comment"}, payload)
+					commentRequestValidated.Store(true)
+					w.WriteHeader(http.StatusCreated)
+					responseData, _ := json.Marshal(mockComment)
+					_, _ = w.Write(responseData)
+				},
+				PatchReposIssuesByOwnerByRepoByIssueNumber: func(w http.ResponseWriter, _ *http.Request) {
+					issueUpdatedDuringComment.Store(true)
+					w.WriteHeader(http.StatusInternalServerError)
+				},
 			}),
 			requestArgs: map[string]any{
 				"owner":        "owner",
@@ -4453,6 +4468,36 @@ func TestAddIssueComment(t *testing.T) {
 				"issue_number": float64(42),
 				"body":         "This is a comment",
 			},
+			expectedCall:   commentRequestValidated,
+			unexpectedCall: issueUpdatedDuringComment,
+		},
+		{
+			name: "comment creation authorization error is propagated",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				PostReposIssuesCommentsByOwnerByRepoByIssueNumber: mockResponse(t, http.StatusUnauthorized, `{"message": "Requires authentication"}`),
+			}),
+			requestArgs: map[string]any{
+				"owner":        "owner",
+				"repo":         "repo",
+				"issue_number": float64(42),
+				"body":         "This is a comment",
+			},
+			expectToolError:    true,
+			expectedToolErrMsg: "Requires authentication",
+		},
+		{
+			name: "comment creation not-found error is propagated",
+			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+				PostReposIssuesCommentsByOwnerByRepoByIssueNumber: mockResponse(t, http.StatusNotFound, `{"message": "Issue not found"}`),
+			}),
+			requestArgs: map[string]any{
+				"owner":        "owner",
+				"repo":         "repo",
+				"issue_number": float64(42),
+				"body":         "This is a comment",
+			},
+			expectToolError:    true,
+			expectedToolErrMsg: "Issue not found",
 		},
 		{
 			name: "successful reaction to issue",
@@ -4539,6 +4584,17 @@ func TestAddIssueComment(t *testing.T) {
 			},
 			expectToolError:    true,
 			expectedToolErrMsg: "at least one of body or reaction is required",
+		},
+		{
+			name: "empty body",
+			requestArgs: map[string]any{
+				"owner":        "owner",
+				"repo":         "repo",
+				"issue_number": float64(42),
+				"body":         "",
+			},
+			expectToolError:    true,
+			expectedToolErrMsg: "body cannot be empty when provided",
 		},
 		{
 			name: "missing issue_number for reaction",
@@ -4642,10 +4698,19 @@ func TestAddIssueComment(t *testing.T) {
 				if tc.unexpectedCall != nil {
 					assert.False(t, tc.unexpectedCall.Load())
 				}
+				if tc.expectedCall != nil {
+					assert.True(t, tc.expectedCall.Load())
+				}
 				return
 			}
 
 			require.False(t, result.IsError)
+			if tc.unexpectedCall != nil {
+				assert.False(t, tc.unexpectedCall.Load())
+			}
+			if tc.expectedCall != nil {
+				assert.True(t, tc.expectedCall.Load())
+			}
 			textContent := getTextResult(t, result)
 			if _, ok := tc.requestArgs["body"]; ok {
 				assert.Contains(t, textContent.Text, "456")
