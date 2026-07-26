@@ -3,6 +3,8 @@ package github
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -582,18 +585,118 @@ type RepositoryChange struct {
 }
 
 type ApplyRepositoryChangesResponse struct {
-	RequestID       string         `json:"request_id"`
-	RequestedTarget map[string]any `json:"requested_target"`
-	AppliedTarget   map[string]any `json:"applied_target"`
-	Changed         bool           `json:"changed"`
-	Verified        bool           `json:"verified"`
-	AuditID         string         `json:"audit_id"`
-	PreviousHeadSHA string         `json:"previous_head_sha"`
-	NewCommitSHA    string         `json:"new_commit_sha"`
-	NewTreeSHA      string         `json:"new_tree_sha"`
-	AddedPaths      []string       `json:"added_paths"`
-	UpdatedPaths    []string       `json:"updated_paths"`
-	DeletedPaths    []string       `json:"deleted_paths"`
+	RequestID               string         `json:"request_id"`
+	RequestedTarget         map[string]any `json:"requested_target"`
+	AppliedTarget           map[string]any `json:"applied_target"`
+	Changed                 bool           `json:"changed"`
+	Verified                bool           `json:"verified"`
+	AuditID                 string         `json:"audit_id"`
+	PreviousHeadSHA         string         `json:"previous_head_sha"`
+	NewCommitSHA            string         `json:"new_commit_sha"`
+	NewTreeSHA              string         `json:"new_tree_sha"`
+	AddedPaths              []string       `json:"added_paths"`
+	UpdatedPaths            []string       `json:"updated_paths"`
+	DeletedPaths            []string       `json:"deleted_paths"`
+	ImmutableRepositoryID   int64          `json:"immutable_repository_id"`
+	Operation               string         `json:"operation"`
+	BranchRef               string         `json:"branch_ref"`
+	PreMutationSHA          string         `json:"pre_mutation_sha"`
+	PostMutationSHA         string         `json:"post_mutation_sha"`
+	AffectedPaths           []string       `json:"affected_paths"`
+	PreviewHash             string         `json:"preview_hash"`
+	PreviewToken            string         `json:"preview_token,omitempty"`
+	VerificationStatus      string         `json:"verification_status"`
+	RepositoryScopeVerified bool           `json:"repository_scope_verified"`
+}
+
+type repositoryMutationTarget struct {
+	Owner           string   `json:"owner"`
+	Repository      string   `json:"repository"`
+	RepositoryID    int64    `json:"repository_id"`
+	Operation       string   `json:"operation"`
+	Branch          string   `json:"branch"`
+	Ref             string   `json:"ref"`
+	Paths           []string `json:"paths"`
+	ExpectedHeadSHA string   `json:"expected_head_sha"`
+}
+
+type repositoryMutationPreview struct {
+	Target      repositoryMutationTarget
+	PreviewHash string
+	RequestID   string
+	AuditID     string
+	ExpiresAt   time.Time
+}
+
+var repositoryMutationPreviews = struct {
+	sync.Mutex
+	items map[string]repositoryMutationPreview
+}{items: make(map[string]repositoryMutationPreview)}
+
+func repositoryMutationToken() string {
+	value := make([]byte, 24)
+	if _, err := cryptorand.Read(value); err != nil {
+		return fmt.Sprintf("ghmcp-preview-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(value)
+}
+
+func repositoryMutationHash(target repositoryMutationTarget, message string, changes []RepositoryChange) string {
+	payload := struct {
+		Target  repositoryMutationTarget `json:"target"`
+		Message string                   `json:"message"`
+		Changes []RepositoryChange       `json:"changes"`
+	}{Target: target, Message: message, Changes: changes}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func validateRepositoryMutationIdentity(ctx context.Context, client *github.Client, owner, repo, branch string) (repositoryMutationTarget, *mcp.CallToolResult, error) {
+	if strings.TrimSpace(owner) == "" || strings.TrimSpace(repo) == "" || strings.TrimSpace(branch) == "" || strings.HasPrefix(branch, "refs/") {
+		return repositoryMutationTarget{}, utils.NewToolResultError("owner, repository, and branch/ref must be explicit and valid"), nil
+	}
+	repository, resp, err := client.Repositories.Get(ctx, owner, repo)
+	if err != nil {
+		return repositoryMutationTarget{}, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to independently resolve requested repository", resp, err), nil
+	}
+	closeResponse(resp)
+	if repository == nil || repository.GetID() == 0 || repository.GetOwner() == nil || !strings.EqualFold(repository.GetOwner().GetLogin(), owner) || !strings.EqualFold(repository.GetName(), repo) {
+		return repositoryMutationTarget{}, utils.NewToolResultError("TARGET_MISMATCH: repository identity does not match the requested owner/repository"), nil
+	}
+	refName := "refs/heads/" + branch
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, refName)
+	if err != nil {
+		return repositoryMutationTarget{}, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to independently resolve requested branch/ref", resp, err), nil
+	}
+	closeResponse(resp)
+	if ref == nil || ref.GetRef() != refName || ref.GetObject() == nil || ref.GetObject().GetSHA() == "" {
+		return repositoryMutationTarget{}, utils.NewToolResultError("TARGET_MISMATCH: requested branch/ref did not resolve exactly"), nil
+	}
+	return repositoryMutationTarget{
+		Owner: owner, Repository: repo, RepositoryID: repository.GetID(), Operation: "atomic_repository_changes",
+		Branch: branch, Ref: refName, ExpectedHeadSHA: ref.GetObject().GetSHA(),
+	}, nil, nil
+}
+
+func verifyRepositoryMutationIdentity(ctx context.Context, client *github.Client, target repositoryMutationTarget) (*mcp.CallToolResult, error) {
+	repository, resp, err := client.Repositories.Get(ctx, target.Owner, target.Repository)
+	if err != nil {
+		return ghErrors.NewGitHubAPIErrorResponse(ctx, "POST_WRITE_VERIFICATION_FAILED: repository identity could not be re-read", resp, err), nil
+	}
+	closeResponse(resp)
+	if repository == nil || repository.GetID() != target.RepositoryID || repository.GetOwner() == nil || !strings.EqualFold(repository.GetOwner().GetLogin(), target.Owner) || !strings.EqualFold(repository.GetName(), target.Repository) {
+		return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: repository identity changed during mutation"), nil
+	}
+	return nil, nil
+}
+
+func gitBlobSHA(content string) string {
+	header := fmt.Sprintf("blob %d\\x00", len([]byte(content)))
+	hash := sha1.New()
+	_, _ = io.WriteString(hash, header)
+	_, _ = io.WriteString(hash, content)
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 func mutationRequestID() string {
@@ -622,6 +725,9 @@ func ApplyRepositoryChanges(t translations.TranslationHelperFunc) inventory.Serv
 					"owner":             {Type: "string", Description: "Repository owner"},
 					"repo":              {Type: "string", Description: "Repository name"},
 					"branch":            {Type: "string", Description: "Branch to update"},
+					"mode":              {Type: "string", Enum: []any{"preview", "apply"}, Description: "preview validates and binds the target; apply requires the matching single-use preview_token and preview_hash"},
+					"preview_token":     {Type: "string", Description: "Single-use token returned by preview"},
+					"preview_hash":      {Type: "string", Description: "Hash returned by preview; must match the apply payload"},
 					"message":           {Type: "string", Description: "Commit message"},
 					"expected_head_sha": {Type: "string", Description: "Expected current branch head full commit SHA"},
 					"changes": {
@@ -672,15 +778,78 @@ func ApplyRepositoryChanges(t translations.TranslationHelperFunc) inventory.Serv
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
+			mode, err := OptionalParam[string](args, "mode")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if mode == "" {
+				mode = "preview"
+			}
+			if mode != "preview" && mode != "apply" {
+				return utils.NewToolResultError("mode must be preview or apply"), nil, nil
+			}
 
 			client, err := deps.GetClient(ctx)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 			}
-			result, apiResult, err := applyRepositoryChanges(ctx, client, owner, repo, branch, message, expectedHeadSHA, changes, mutationRequestID())
+			target, apiResult, err := validateRepositoryMutationIdentity(ctx, client, owner, repo, branch)
 			if apiResult != nil || err != nil {
 				return apiResult, nil, err
 			}
+			target.Paths = make([]string, 0, len(changes))
+			for _, change := range changes {
+				target.Paths = append(target.Paths, change.Path)
+			}
+			target.ExpectedHeadSHA = target.ExpectedHeadSHA
+			if expectedHeadSHA != "" && expectedHeadSHA != target.ExpectedHeadSHA {
+				return utils.NewToolResultError(fmt.Sprintf("expected_head_sha mismatch: current branch head is %s", target.ExpectedHeadSHA)), nil, nil
+			}
+			targetHash := repositoryMutationHash(target, message, changes)
+			if mode == "preview" {
+				token := repositoryMutationToken()
+				requestID := mutationRequestID()
+				repositoryMutationPreviews.Lock()
+				repositoryMutationPreviews.items[token] = repositoryMutationPreview{Target: target, PreviewHash: targetHash, RequestID: requestID, AuditID: requestID, ExpiresAt: time.Now().Add(15 * time.Minute)}
+				repositoryMutationPreviews.Unlock()
+				return MarshalledTextResult(ApplyRepositoryChangesResponse{
+					RequestID: requestID, AuditID: requestID, RequestedTarget: map[string]any{"owner": owner, "repo": repo, "repository_id": target.RepositoryID, "operation": target.Operation, "branch": branch, "ref": target.Ref, "paths": target.Paths},
+					AppliedTarget: map[string]any{"owner": owner, "repo": repo, "repository_id": target.RepositoryID, "branch": branch, "ref": target.Ref}, Changed: false, Verified: true,
+					ImmutableRepositoryID: target.RepositoryID, Operation: target.Operation, BranchRef: target.Ref, PreMutationSHA: target.ExpectedHeadSHA, PreviousHeadSHA: target.ExpectedHeadSHA, AffectedPaths: target.Paths, PreviewHash: targetHash, PreviewToken: token, VerificationStatus: "preview_validated", RepositoryScopeVerified: true,
+				}), nil, nil
+			}
+
+			previewToken, _ := OptionalParam[string](args, "preview_token")
+			previewHash, _ := OptionalParam[string](args, "preview_hash")
+			if previewToken == "" || previewHash == "" {
+				return utils.NewToolResultError("preview_token and preview_hash are required for apply"), nil, nil
+			}
+			repositoryMutationPreviews.Lock()
+			preview, ok := repositoryMutationPreviews.items[previewToken]
+			if ok && preview.ExpiresAt.Before(time.Now()) {
+				delete(repositoryMutationPreviews.items, previewToken)
+				ok = false
+			}
+			repositoryMutationPreviews.Unlock()
+			if !ok {
+				return utils.NewToolResultError("preview token is missing, stale, or already used"), nil, nil
+			}
+			if previewHash != preview.PreviewHash || targetHash != preview.PreviewHash || target.RepositoryID != preview.Target.RepositoryID || target.Owner != preview.Target.Owner || target.Repository != preview.Target.Repository || target.Ref != preview.Target.Ref || target.ExpectedHeadSHA != preview.Target.ExpectedHeadSHA {
+				return utils.NewToolResultError("TARGET_MISMATCH: apply target differs from the preview binding"), nil, nil
+			}
+			repositoryMutationPreviews.Lock()
+			if current, stillAvailable := repositoryMutationPreviews.items[previewToken]; !stillAvailable || current.PreviewHash != preview.PreviewHash {
+				repositoryMutationPreviews.Unlock()
+				return utils.NewToolResultError("preview token is missing, stale, or already used"), nil, nil
+			}
+			delete(repositoryMutationPreviews.items, previewToken)
+			repositoryMutationPreviews.Unlock()
+			result, apiResult, err := applyRepositoryChanges(ctx, client, owner, repo, branch, message, preview.Target.ExpectedHeadSHA, changes, preview.RequestID)
+			if apiResult != nil || err != nil {
+				return apiResult, nil, err
+			}
+			result.PreviewHash = preview.PreviewHash
+			result.PreviewToken = previewToken
 			return MarshalledTextResult(result), nil, nil
 		},
 	)
@@ -1439,6 +1608,13 @@ func validateRepositoryChangePath(path string) error {
 }
 
 func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, repo, branch, message, expectedHeadSHA string, changes []RepositoryChange, requestID string) (*ApplyRepositoryChangesResponse, *mcp.CallToolResult, error) {
+	target, apiResult, err := validateRepositoryMutationIdentity(ctx, client, owner, repo, branch)
+	if apiResult != nil || err != nil {
+		return nil, apiResult, err
+	}
+	if expectedHeadSHA != "" && target.ExpectedHeadSHA != expectedHeadSHA {
+		return nil, utils.NewToolResultError(fmt.Sprintf("expected_head_sha mismatch: current branch head is %s", target.ExpectedHeadSHA)), nil
+	}
 	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
 	if err != nil {
 		return nil, ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get branch reference", resp, err), nil
@@ -1547,6 +1723,9 @@ func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, r
 		return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: branch head does not belong to the requested repository/branch"), nil
 	}
 	closeResponse(resp)
+	if apiResult, err := verifyRepositoryMutationIdentity(ctx, client, target); apiResult != nil || err != nil {
+		return nil, apiResult, err
+	}
 	verifiedCommit, resp, err := client.Git.GetCommit(ctx, owner, repo, newCommit.GetSHA())
 	if err != nil || verifiedCommit == nil || verifiedCommit.GetSHA() != newCommit.GetSHA() || len(verifiedCommit.Parents) == 0 || verifiedCommit.Parents[0].GetSHA() != previousHead {
 		closeResponse(resp)
@@ -1596,20 +1775,31 @@ func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, r
 		if change.Operation == "upsert" && (!exists || entry.GetType() != "blob") {
 			return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: requested path was not written as a blob"), nil
 		}
+		if change.Operation == "upsert" && entry.GetSHA() != gitBlobSHA(change.Content) {
+			return nil, utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: requested path content does not match the requested payload"), nil
+		}
 	}
 	return &ApplyRepositoryChangesResponse{
-		RequestID:       requestID,
-		RequestedTarget: map[string]any{"owner": owner, "repo": repo, "branch": branch, "paths": requestedPathList},
-		AppliedTarget:   map[string]any{"owner": owner, "repo": repo, "branch": branch, "commit_sha": newCommit.GetSHA()},
-		Changed:         true,
-		Verified:        true,
-		AuditID:         requestID,
-		PreviousHeadSHA: previousHead,
-		NewCommitSHA:    newCommit.GetSHA(),
-		NewTreeSHA:      newTree.GetSHA(),
-		AddedPaths:      added,
-		UpdatedPaths:    updated,
-		DeletedPaths:    deleted,
+		RequestID:               requestID,
+		RequestedTarget:         map[string]any{"owner": owner, "repo": repo, "branch": branch, "paths": requestedPathList},
+		AppliedTarget:           map[string]any{"owner": owner, "repo": repo, "branch": branch, "commit_sha": newCommit.GetSHA()},
+		Changed:                 true,
+		Verified:                true,
+		AuditID:                 requestID,
+		PreviousHeadSHA:         previousHead,
+		NewCommitSHA:            newCommit.GetSHA(),
+		NewTreeSHA:              newTree.GetSHA(),
+		AddedPaths:              added,
+		UpdatedPaths:            updated,
+		DeletedPaths:            deleted,
+		ImmutableRepositoryID:   target.RepositoryID,
+		Operation:               target.Operation,
+		BranchRef:               target.Ref,
+		PreMutationSHA:          previousHead,
+		PostMutationSHA:         newCommit.GetSHA(),
+		AffectedPaths:           requestedPathList,
+		VerificationStatus:      "verified",
+		RepositoryScopeVerified: true,
 	}, nil, nil
 }
 

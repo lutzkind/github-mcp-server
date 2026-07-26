@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -4065,7 +4066,7 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 	const deleteBlobSHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 	baseHandlers := func(t *testing.T, createTreeOK bool, updateRefSeen *bool) map[string]http.HandlerFunc {
-		refReads := 0
+		currentHead := headSHA
 		commitReads := 0
 		treeReads := 0
 		verifiedEntries := map[string]map[string]any{
@@ -4082,18 +4083,14 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 			return result
 		}
 		return map[string]http.HandlerFunc{
+			GetReposByOwnerByRepo: mockResponse(t, http.StatusOK, `{"id":12345,"name":"repo","full_name":"owner/repo","owner":{"login":"owner"}}`),
 			GetReposGitRefByOwnerByRepoByRef: func(w http.ResponseWriter, _ *http.Request) {
-				refReads++
-				sha := headSHA
-				if refReads > 1 {
-					sha = newCommitSHA
-				}
-				mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+sha+`"}}`)(w, nil)
+				mockResponse(t, http.StatusOK, `{"ref":"refs/heads/work","object":{"type":"commit","sha":"`+currentHead+`"}}`)(w, nil)
 			},
 			GetReposGitCommitsByOwnerByRepoByCommitSHA: func(w http.ResponseWriter, _ *http.Request) {
 				commitReads++
 				sha, tree := headSHA, baseTreeSHA
-				if commitReads > 1 {
+				if currentHead == newCommitSHA || commitReads > 1 {
 					sha, tree = newCommitSHA, newTreeSHA
 				}
 				mockResponse(t, http.StatusOK, `{"sha":"`+sha+`","tree":{"sha":"`+tree+`"},"parents":[{"sha":"`+headSHA+`"}]}`)(w, nil)
@@ -4129,7 +4126,7 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 						delete(verifiedEntries, entry.Path)
 						continue
 					}
-					verifiedEntries[entry.Path] = map[string]any{"path": entry.Path, "mode": "100644", "type": "blob", "sha": "generated-" + entry.Path}
+					verifiedEntries[entry.Path] = map[string]any{"path": entry.Path, "mode": "100644", "type": "blob", "sha": gitBlobSHA(*entry.Content)}
 				}
 				w.WriteHeader(http.StatusCreated)
 				_, _ = w.Write([]byte(`{"sha":"` + newTreeSHA + `"}`))
@@ -4139,6 +4136,7 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 				if updateRefSeen != nil {
 					*updateRefSeen = true
 				}
+				currentHead = newCommitSHA
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{"ref":"refs/heads/work","object":{"type":"commit","sha":"` + newCommitSHA + `"}}`))
 			},
@@ -4146,13 +4144,14 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 	}
 
 	tests := []struct {
-		name          string
-		args          map[string]any
-		handlers      map[string]http.HandlerFunc
-		expectError   bool
-		errorText     string
-		assertResult  func(t *testing.T, text string)
-		assertNoWrite *bool
+		name             string
+		args             map[string]any
+		handlers         map[string]http.HandlerFunc
+		expectError      bool
+		expectApplyError bool
+		errorText        string
+		assertResult     func(t *testing.T, text string)
+		assertNoWrite    *bool
 	}{
 		{
 			name:     "add one file",
@@ -4204,10 +4203,10 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 			},
 		},
 		{name: "expected branch head mismatch", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "expected_head_sha": newCommitSHA, "changes": []any{map[string]any{"path": "new.txt", "operation": "upsert", "content": "x"}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "expected_head_sha mismatch"},
-		{name: "expected blob mismatch", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "update.txt", "operation": "upsert", "content": "x", "expected_blob_sha": deleteBlobSHA}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "expected_blob_sha mismatch"},
+		{name: "expected blob mismatch", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "update.txt", "operation": "upsert", "content": "x", "expected_blob_sha": deleteBlobSHA}}}, handlers: baseHandlers(t, true, nil), expectApplyError: true, errorText: "expected_blob_sha mismatch"},
 		{name: "duplicate paths rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "x.txt", "operation": "upsert", "content": "x"}, map[string]any{"path": "x.txt", "operation": "upsert", "content": "y"}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "duplicate path"},
 		{name: "traversal path rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "../x.txt", "operation": "upsert", "content": "x"}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "invalid repository file path"},
-		{name: "missing delete target rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "missing.txt", "operation": "delete", "expected_blob_sha": oldBlobSHA}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "cannot delete missing path"},
+		{name: "missing delete target rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "missing.txt", "operation": "delete", "expected_blob_sha": oldBlobSHA}}}, handlers: baseHandlers(t, true, nil), expectApplyError: true, errorText: "cannot delete missing path"},
 		{name: "delete with content rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "delete.txt", "operation": "delete", "content": "x", "expected_blob_sha": deleteBlobSHA}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "content is not allowed"},
 		{name: "upsert without content rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "new.txt", "operation": "upsert"}}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "content is required"},
 		{name: "no-op request rejected", args: map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{}}, handlers: baseHandlers(t, true, nil), expectError: true, errorText: "must not be empty"},
@@ -4216,9 +4215,26 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(tc.handlers))}
-			result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(tc.args)))
+			request := serverTool.Handler(deps)
+			previewArgs := maps.Clone(tc.args)
+			previewArgs["mode"] = "preview"
+			result, err := request(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(previewArgs)))
 			require.NoError(t, err)
 			if tc.expectError {
+				require.True(t, result.IsError)
+				assert.Contains(t, getErrorResult(t, result).Text, tc.errorText)
+				return
+			}
+			require.False(t, result.IsError)
+			var preview ApplyRepositoryChangesResponse
+			require.NoError(t, json.Unmarshal([]byte(getTextResult(t, result).Text), &preview))
+			applyArgs := maps.Clone(tc.args)
+			applyArgs["mode"] = "apply"
+			applyArgs["preview_token"] = preview.PreviewToken
+			applyArgs["preview_hash"] = preview.PreviewHash
+			result, err = request(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(applyArgs)))
+			require.NoError(t, err)
+			if tc.expectApplyError {
 				require.True(t, result.IsError)
 				assert.Contains(t, getErrorResult(t, result).Text, tc.errorText)
 				return
@@ -4235,7 +4251,18 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 		handlers := baseHandlers(t, true, &updateRefSeen)
 		deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(handlers))}
 		args := map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "missing.txt", "operation": "delete", "expected_blob_sha": oldBlobSHA}}}
-		result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(args)))
+		request := serverTool.Handler(deps)
+		previewArgs := maps.Clone(args)
+		previewArgs["mode"] = "preview"
+		previewResult, err := request(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(previewArgs)))
+		require.NoError(t, err)
+		var preview ApplyRepositoryChangesResponse
+		require.NoError(t, json.Unmarshal([]byte(getTextResult(t, previewResult).Text), &preview))
+		applyArgs := maps.Clone(args)
+		applyArgs["mode"] = "apply"
+		applyArgs["preview_token"] = preview.PreviewToken
+		applyArgs["preview_hash"] = preview.PreviewHash
+		result, err := request(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(applyArgs)))
 		require.NoError(t, err)
 		require.True(t, result.IsError)
 		assert.False(t, updateRefSeen)
@@ -4246,10 +4273,52 @@ func Test_ApplyRepositoryChanges(t *testing.T) {
 		handlers := baseHandlers(t, false, &updateRefSeen)
 		deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(handlers))}
 		args := map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "new.txt", "operation": "upsert", "content": "x"}}}
-		result, err := serverTool.Handler(deps)(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(args)))
+		request := serverTool.Handler(deps)
+		previewArgs := maps.Clone(args)
+		previewArgs["mode"] = "preview"
+		previewResult, err := request(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(previewArgs)))
+		require.NoError(t, err)
+		var preview ApplyRepositoryChangesResponse
+		require.NoError(t, json.Unmarshal([]byte(getTextResult(t, previewResult).Text), &preview))
+		applyArgs := maps.Clone(args)
+		applyArgs["mode"] = "apply"
+		applyArgs["preview_token"] = preview.PreviewToken
+		applyArgs["preview_hash"] = preview.PreviewHash
+		result, err := request(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(applyArgs)))
 		require.NoError(t, err)
 		require.True(t, result.IsError)
 		assert.False(t, updateRefSeen)
+	})
+
+	t.Run("failed read-after-write verification is never reported as success", func(t *testing.T) {
+		handlers := baseHandlers(t, true, nil)
+		refReads := 0
+		originalRefHandler := handlers[GetReposGitRefByOwnerByRepoByRef]
+		handlers[GetReposGitRefByOwnerByRepoByRef] = func(w http.ResponseWriter, r *http.Request) {
+			refReads++
+			if refReads >= 5 {
+				mockResponse(t, http.StatusOK, `{"ref":"refs/heads/main","object":{"type":"commit","sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}`)(w, r)
+				return
+			}
+			originalRefHandler(w, r)
+		}
+		deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(handlers))}
+		request := serverTool.Handler(deps)
+		args := map[string]any{"owner": "owner", "repo": "repo", "branch": "work", "message": "x", "changes": []any{map[string]any{"path": "new.txt", "operation": "upsert", "content": "x"}}}
+		previewArgs := maps.Clone(args)
+		previewArgs["mode"] = "preview"
+		previewResult, err := request(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(previewArgs)))
+		require.NoError(t, err)
+		var preview ApplyRepositoryChangesResponse
+		require.NoError(t, json.Unmarshal([]byte(getTextResult(t, previewResult).Text), &preview))
+		applyArgs := maps.Clone(args)
+		applyArgs["mode"] = "apply"
+		applyArgs["preview_token"] = preview.PreviewToken
+		applyArgs["preview_hash"] = preview.PreviewHash
+		result, err := request(ContextWithDeps(context.Background(), deps), ptrRequest(createMCPRequest(applyArgs)))
+		require.NoError(t, err)
+		require.True(t, result.IsError)
+		assert.Contains(t, getErrorResult(t, result).Text, "POST_WRITE_VERIFICATION_FAILED")
 	})
 }
 
