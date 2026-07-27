@@ -1803,6 +1803,27 @@ func applyRepositoryChanges(ctx context.Context, client *github.Client, owner, r
 	}, nil, nil
 }
 
+func retryBranchHeadVerification(expected string, attempts int, delay time.Duration, read func() (string, error)) (string, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var last string
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		last, lastErr = read()
+		if lastErr == nil && last == expected {
+			return last, nil
+		}
+		if attempt < attempts-1 && delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+	if lastErr != nil {
+		return last, fmt.Errorf("branch head verification failed after %d attempts: %w", attempts, lastErr)
+	}
+	return last, fmt.Errorf("branch head verification failed after %d attempts: expected %s, got %s", attempts, expected, last)
+}
+
 func createOrUpdateFileOperation(ctx context.Context, deps ToolDependencies, client *github.Client, owner, repo, path, message, branch, expectedSHA string, dryRun bool, patch filePatchInput) (*mcp.CallToolResult, any, error) {
 	path = strings.TrimPrefix(path, "/")
 	file, before, resp, err := getCurrentGitHubFile(ctx, client, owner, repo, path, branch)
@@ -1890,10 +1911,34 @@ func createOrUpdateFileOperation(ctx context.Context, deps ToolDependencies, cli
 	if commitSHA == "" {
 		return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: GitHub did not return a commit SHA for the requested file"), nil, nil
 	}
-	verifiedRef, verifyRefResp, verifyRefErr := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
-	closeResponse(verifyRefResp)
-	if verifyRefErr != nil || verifiedRef == nil || verifiedRef.GetObject().GetSHA() != commitSHA {
-		return utils.NewToolResultError("POST_WRITE_VERIFICATION_FAILED: file commit does not belong to the requested repository branch"), nil, nil
+	verifiedHead, verifyRefErr := retryBranchHeadVerification(commitSHA, 5, 250*time.Millisecond, func() (string, error) {
+		verifiedRef, verifyRefResp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
+		closeResponse(verifyRefResp)
+		if err != nil {
+			return "", err
+		}
+		if verifiedRef == nil || verifiedRef.GetObject() == nil {
+			return "", fmt.Errorf("GitHub returned an incomplete branch reference")
+		}
+		return verifiedRef.GetObject().GetSHA(), nil
+	})
+	if verifyRefErr != nil {
+		requestID := mutationRequestID()
+		result := MarshalledTextResult(map[string]any{
+			"ok":                  false,
+			"error_code":          "POST_WRITE_VERIFICATION_INCOMPLETE",
+			"message":             "The file write returned a commit and exact content verification passed, but the branch head could not be confirmed after bounded retries.",
+			"applied":             true,
+			"changed":             true,
+			"verified":            false,
+			"verification_status": "write_succeeded_branch_verification_incomplete",
+			"request_id":          requestID,
+			"audit_id":            requestID,
+			"requested_target":    map[string]any{"owner": owner, "repo": repo, "branch": branch, "path": path, "expected_blob_sha": expectedSHA},
+			"applied_target":      map[string]any{"owner": owner, "repo": repo, "branch": branch, "path": path, "commit_sha": commitSHA, "blob_sha": verified.GetSHA(), "observed_branch_head": verifiedHead},
+		})
+		result.IsError = true
+		return result, nil, nil
 	}
 	if exists && verified.GetSHA() == expectedSHA {
 		return utils.NewToolResultError("post-commit verification failed: blob SHA did not change"), nil, nil

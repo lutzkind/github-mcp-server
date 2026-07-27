@@ -1640,6 +1640,33 @@ func Test_ListCommits(t *testing.T) {
 	}
 }
 
+func TestRetryBranchHeadVerification(t *testing.T) {
+	t.Run("transient stale ref converges", func(t *testing.T) {
+		values := []string{"old-head", "old-head", "new-head"}
+		calls := 0
+		actual, err := retryBranchHeadVerification("new-head", 5, 0, func() (string, error) {
+			value := values[calls]
+			calls++
+			return value, nil
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "new-head", actual)
+		assert.Equal(t, 3, calls)
+	})
+
+	t.Run("persistent stale ref is reported after bound", func(t *testing.T) {
+		calls := 0
+		actual, err := retryBranchHeadVerification("new-head", 3, 0, func() (string, error) {
+			calls++
+			return "old-head", nil
+		})
+		require.Error(t, err)
+		assert.Equal(t, "old-head", actual)
+		assert.Equal(t, 3, calls)
+		assert.Contains(t, err.Error(), "expected new-head, got old-head")
+	})
+}
+
 func Test_CreateOrUpdateFile(t *testing.T) {
 	// Verify tool definition once
 	serverTool := CreateOrUpdateFile(translations.NullTranslationHelper)
