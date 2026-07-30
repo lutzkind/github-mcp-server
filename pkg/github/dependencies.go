@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -235,7 +236,8 @@ func NewTool[In, Out any](
 ) inventory.ServerTool {
 	st := inventory.NewServerToolWithContextHandler(tool, toolset, func(ctx context.Context, req *mcp.CallToolRequest, args In) (*mcp.CallToolResult, Out, error) {
 		deps := MustDepsFromContext(ctx)
-		return handler(ctx, deps, req, args)
+		result, out, err := handler(ctx, deps, req, args)
+		return attachResponseAttestation(tool, req, result), out, err
 	})
 	st.RequiredScopes = scopes.ToStringSlice(requiredScopes...)
 	st.AcceptedScopes = scopes.ExpandScopes(requiredScopes...)
@@ -258,11 +260,57 @@ func NewToolFromHandler(
 ) inventory.ServerTool {
 	st := inventory.NewServerTool(tool, toolset, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		deps := MustDepsFromContext(ctx)
-		return handler(ctx, deps, req)
+		result, err := handler(ctx, deps, req)
+		return attachResponseAttestation(tool, req, result), err
 	})
 	st.RequiredScopes = scopes.ToStringSlice(requiredScopes...)
 	st.AcceptedScopes = scopes.ExpandScopes(requiredScopes...)
 	return st
+}
+
+// attachResponseAttestation makes successful GitHub mutations self-describing
+// for the profile bridge. The bridge validates these fields before restoring
+// the caller's JSON-RPC id, preventing a response from being accepted merely
+// because it arrived on the shared upstream session.
+func attachResponseAttestation(tool mcp.Tool, req *mcp.CallToolRequest, result *mcp.CallToolResult) *mcp.CallToolResult {
+	if result == nil || result.IsError || tool.Annotations == nil || tool.Annotations.ReadOnlyHint {
+		return result
+	}
+	args := map[string]any{}
+	if req != nil {
+		_ = json.Unmarshal(req.Params.Arguments, &args)
+	}
+	target := map[string]any{"tool_name": tool.Name}
+	for _, key := range []string{"owner", "repo", "repository", "repository_id", "repo_id", "immutable_repository_id", "branch", "ref", "path", "operation", "method", "action", "mode", "expected_head_sha", "preview_hash"} {
+		if value, ok := args[key]; ok && value != nil {
+			target[key] = value
+		}
+	}
+	if paths, ok := args["paths"]; ok {
+		target["paths"] = paths
+	}
+	if changes, ok := args["changes"].([]any); ok {
+		paths := make([]string, 0, len(changes))
+		for _, item := range changes {
+			if entry, ok := item.(map[string]any); ok {
+				if path, ok := entry["path"].(string); ok {
+					paths = append(paths, path)
+				}
+			}
+		}
+		target["paths"] = paths
+	}
+	if existing, ok := result.StructuredContent.(map[string]any); ok {
+		copy := make(map[string]any, len(existing)+1)
+		for key, value := range existing {
+			copy[key] = value
+		}
+		copy["response_attestation"] = target
+		result.StructuredContent = copy
+	} else {
+		result.StructuredContent = map[string]any{"response_attestation": target}
+	}
+	return result
 }
 
 type RequestDeps struct {

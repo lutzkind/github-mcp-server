@@ -55,8 +55,24 @@
         "description": "Commit message",
         "type": "string"
       },
+      "mode": {
+        "description": "preview validates and binds the target; apply requires the matching single-use preview_token and preview_hash",
+        "enum": [
+          "preview",
+          "apply"
+        ],
+        "type": "string"
+      },
       "owner": {
         "description": "Repository owner",
+        "type": "string"
+      },
+      "preview_hash": {
+        "description": "Hash returned by preview; must match the apply payload",
+        "type": "string"
+      },
+      "preview_token": {
+        "description": "Single-use token returned by preview",
         "type": "string"
       },
       "repo": {
