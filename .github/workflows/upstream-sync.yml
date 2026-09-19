@@ -1,0 +1,54 @@
+name: Upstream Sync
+
+# Creates upstream-sync/YYYYMMDD from origin/main, merges (or rebases) upstream/main
+# into it, pushes the branch and opens a PR against main. This workflow never
+# pushes to main. See FORK_GOVERNANCE.md and script/upstream-sync.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Integrate upstream/main with merge or rebase"
+        type: choice
+        options:
+          - merge
+          - rebase
+        default: merge
+  schedule:
+    # Monthly, first day of the month at 06:00 UTC. Remove if maintainers
+    # prefer manual dispatch only.
+    - cron: "0 6 1 * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out main
+        # actions/checkout v7.0.1, SHA-pinned per audit requirement PA-62
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync upstream into upstream-sync branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_URL: https://github.com/github/github-mcp-server.git
+          MODE: ${{ inputs.mode || 'merge' }}
+        run: |
+          set -euo pipefail
+          script/upstream-sync --mode "$MODE" --push --pr --report-conflicts
