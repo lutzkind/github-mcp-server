@@ -48,7 +48,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_URL: https://github.com/github/github-mcp-server.git
-          MODE: ${{ inputs.mode || 'merge' }}
+          MODE: ${{ github.event.inputs.mode || 'merge' }}
         run: |
           set -euo pipefail
-          script/upstream-sync --mode "$MODE" --push --pr --report-conflicts
+          script/upstream-sync --mode "${MODE:-merge}" --push --pr --report-conflicts
