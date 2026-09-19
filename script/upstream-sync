@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+#
+# upstream-sync - prepare an upstream integration branch for lutzkind/github-mcp-server.
+#
+# This helper NEVER pushes to main. It:
+#   1. fetches origin/main and upstream/main,
+#   2. creates upstream-sync/YYYYMMDD from origin/main,
+#   3. attempts to merge (default) or rebase onto upstream/main,
+#   4. with --push, pushes the sync branch to origin,
+#   5. with --pr, opens a pull request against main via gh.
+#
+# On conflict the default behaviour is to abort, leave the checkout on the sync
+# branch, and exit 2. With --report-conflicts, the conflicted paths are recorded
+# in UPSTREAM_SYNC_CONFLICTS.md and committed to the sync branch so the attempt
+# can be reviewed in a PR (used by .github/workflows/upstream-sync.yml).
+#
+# Usage:
+#   script/upstream-sync [--mode merge|rebase] [--date YYYYMMDD]
+#                        [--push] [--pr] [--report-conflicts]
+#                        [--upstream-url URL] [--upstream-remote NAME]
+#
+# Environment:
+#   GH_TOKEN   optional token for authenticated push and `gh pr create` (CI)
+#
+# Exit codes: 0 success, 2 merge/rebase conflict, 3 preflight failure.
+
+set -euo pipefail
+
+UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/github/github-mcp-server.git}"
+UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
+MODE=merge
+DATE="$(date -u +%Y%m%d)"
+PUSH=0
+PR=0
+REPORT=0
+
+usage() {
+  sed -n '2,24p' "$0"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode) MODE="${2:?--mode needs a value}"; shift 2 ;;
+    --date) DATE="${2:?--date needs a value}"; shift 2 ;;
+    --push) PUSH=1; shift ;;
+    --pr) PR=1; PUSH=1; shift ;;
+    --report-conflicts) REPORT=1; shift ;;
+    --upstream-url) UPSTREAM_URL="${2:?--upstream-url needs a value}"; shift 2 ;;
+    --upstream-remote) UPSTREAM_REMOTE="${2:?--upstream-remote needs a value}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 3 ;;
+  esac
+done
+
+if [[ "$MODE" != merge && "$MODE" != rebase ]]; then
+  echo "error: --mode must be 'merge' or 'rebase' (got '$MODE')" >&2
+  exit 3
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "error: working tree is not clean; commit or stash first" >&2
+  exit 3
+fi
+
+BRANCH="upstream-sync/$DATE"
+if [[ "$BRANCH" == "main" ]]; then
+  echo "error: refusing to operate on main" >&2
+  exit 3
+fi
+
+git fetch origin main --no-tags
+git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL" 2>/dev/null \
+  || git remote set-url "$UPSTREAM_REMOTE" "$UPSTREAM_URL"
+git fetch "$UPSTREAM_REMOTE" main --no-tags
+
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  echo "error: local branch $BRANCH already exists; delete it or pass --date" >&2
+  exit 3
+fi
+
+BASE_SHA="$(git rev-parse origin/main)"
+UPSTREAM_SHA="$(git rev-parse "$UPSTREAM_REMOTE/main")"
+echo "origin/main   $BASE_SHA"
+echo "upstream/main $UPSTREAM_SHA"
+echo "sync branch   $BRANCH (from origin/main, never main)"
+
+git checkout -b "$BRANCH" origin/main
+
+CONFLICTS=""
+if [[ "$MODE" == merge ]]; then
+  if ! git merge --no-edit "$UPSTREAM_REMOTE/main"; then
+    CONFLICTS="$(git diff --name-only --diff-filter=U | sort -u)"
+    git merge --abort
+  fi
+else
+  if ! git rebase "$UPSTREAM_REMOTE/main"; then
+    CONFLICTS="$(git diff --name-only --diff-filter=U | sort -u)"
+    git rebase --abort
+  fi
+fi
+
+if [[ -n "$CONFLICTS" ]]; then
+  echo "upstream sync conflicts in:"
+  printf '  %s\n' $CONFLICTS
+  if [[ "$REPORT" == 1 ]]; then
+    {
+      echo "# Upstream sync conflicts - $DATE"
+      echo
+      echo "Automated ${MODE} of \`upstream/main\` ($UPSTREAM_SHA) into \`origin/main\` ($BASE_SHA)"
+      echo "conflicted. Resolve the paths below on this branch and delete this file,"
+      echo "then rerun \`script/test\` before merging."
+      echo
+      echo "Conflict policy: see FORK_GOVERNANCE.md. Guarded mutation code in"
+      echo "\`pkg/github/repositories.go\` must keep the fork preview/target binding"
+      echo "semantics; \`pkg/github/mutation_guard_test.go\` and \`pkg/github/file_patches_test.go\`"
+      echo "are the invariant tests."
+      echo
+      echo "## Conflicted paths"
+      echo
+      printf -- '- `%s`\n' $CONFLICTS
+      echo
+      echo "## Reproduction"
+      echo
+      echo '```'
+      echo "git fetch $UPSTREAM_REMOTE main"
+      echo "git checkout $BRANCH"
+      echo "git merge $UPSTREAM_REMOTE/main   # or: git rebase $UPSTREAM_REMOTE/main"
+      echo '```'
+    } > UPSTREAM_SYNC_CONFLICTS.md
+    git add UPSTREAM_SYNC_CONFLICTS.md
+    git commit -m "chore(upstream-sync): record $DATE conflict set"
+    echo "conflict report committed on $BRANCH"
+  else
+    echo "aborted with no changes; rerun with --report-conflicts to record the list" >&2
+    exit 2
+  fi
+fi
+
+if [[ "$PUSH" == 1 ]]; then
+  ORIGIN_URL="$(git remote get-url origin)"
+  if [[ -n "${GH_TOKEN:-}" && "$ORIGIN_URL" == https://github.com/* ]]; then
+    git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
+      push origin "HEAD:refs/heads/${BRANCH}"
+  else
+    git push origin "HEAD:refs/heads/${BRANCH}"
+  fi
+else
+  echo "not pushed (pass --push to publish $BRANCH)"
+fi
+
+if [[ "$PR" == 1 ]]; then
+  command -v gh >/dev/null 2>&1 || { echo "error: gh not found; push done, open the PR manually" >&2; exit 3; }
+  EXISTING="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
+  if [[ -n "$EXISTING" ]]; then
+    echo "open PR already exists: $EXISTING"
+  else
+    TITLE="chore(upstream-sync): integrate upstream/main ($DATE)"
+    if [[ -n "$CONFLICTS" ]]; then
+      TITLE="[conflicts] chore(upstream-sync): upstream/main ($DATE) needs manual resolution"
+    fi
+    gh pr create --base main --head "$BRANCH" --title "$TITLE" --body \
+"Automated upstream sync branch \`$BRANCH\`.
+
+- fork base: \`$BASE_SHA\` (origin/main)
+- upstream: \`$UPSTREAM_SHA\` ($UPSTREAM_REMOTE/main)
+- mode: \`$MODE\`
+- conflicts: \`${CONFLICTS:-none}\`
+
+Review FORK_GOVERNANCE.md for the conflict policy before merging.
+This PR is the only integration path; automation never pushes to main."
+  fi
+fi
+
+echo "done: $BRANCH is at $(git rev-parse --short HEAD)"
